@@ -1,0 +1,7 @@
+/Manifest.toml
+*.swp
+.DS_Store
+.vscode
+.julia/
+docs/build/
+docs/Manifest.toml
