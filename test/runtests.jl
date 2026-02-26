@@ -691,6 +691,58 @@ end
     @test trans_m ≤ trans_u
 end
 
+@testset "Convection 1D Inflow BC (Meaningful Schemes)" begin
+    m = build_1d_full_moments()
+    cases = (
+        ("lo", AdvBoxBC((AdvInflow(1.0),), (AdvOutflow{Float64}(),)), 1.0),
+        ("hi", AdvBoxBC((AdvOutflow{Float64}(),), (AdvInflow(-2.0),)), -1.0),
+    )
+
+    for (name, bc_adv, uconst) in cases
+        copsA = assembled_convection_ops(m; bc_adv=bc_adv)
+        copsK = kernel_convection_ops(m; bc_adv=bc_adv)
+        work = KernelWork(copsK)
+
+        Nd = copsA.Nd
+        n = copsA.dims[1]
+        last_phys = n - 1
+        uω = (fill(uconst, Nd),)
+        uγ = (zeros(Float64, Nd),)
+        Tω = zeros(Float64, Nd)
+        Tγ = zeros(Float64, Nd)
+
+        outA = convection_matrix(copsA, uω, uγ, Tω, Tγ; scheme=Upwind1())
+        outK = zeros(Float64, Nd)
+        convection!(outK, copsK, uω, uγ, Tω, Tγ, work; scheme=Upwind1())
+
+        @test isapprox(outA, outK; atol=1e-13, rtol=1e-13)
+        @test maximum(abs, outK) > 0.0
+        @test abs(sum(outK)) ≤ 1e-12
+
+        if name == "lo"
+            @test outK[1] > 0.0
+            @test outK[2] < 0.0
+        else
+            @test outK[last_phys - 1] > 0.0
+            @test outK[last_phys] < 0.0
+        end
+    end
+
+    # Inflow also affects MUSCL (kernel path) through ghost-aware upwind selection.
+    bc_adv_lo = AdvBoxBC((AdvInflow(1.0),), (AdvOutflow{Float64}(),))
+    copsK = kernel_convection_ops(m; bc_adv=bc_adv_lo)
+    work = KernelWork(copsK)
+    Nd = copsK.Nd
+    uω = (fill(1.0, Nd),)
+    uγ = (zeros(Float64, Nd),)
+    Tω = zeros(Float64, Nd)
+    Tγ = zeros(Float64, Nd)
+    outM = zeros(Float64, Nd)
+    convection!(outM, copsK, uω, uγ, Tω, Tγ, work; scheme=MUSCL(MC()))
+    @test all(isfinite, outM)
+    @test maximum(abs, outM) > 0.0
+end
+
 @testset "AdvectionDiffusion Equivalence 2D Full" begin
     m = build_2d_full_moments()
     bc = BoxBC(

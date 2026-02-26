@@ -56,6 +56,13 @@ Available advection BCs:
 - `AdvInflow(value)`
 - `AdvPeriodic`
 
+`AdvInflow(value)` is meaningful for upwind-based advection:
+
+- kernel: `Upwind1()` and `MUSCL(...)`
+- assembled: `Upwind1()`
+
+Centered advection does not consume inflow ghost values.
+
 Diffusion-style Dirichlet row replacement is **not** applied automatically to convection.
 
 ## Interior vs Exterior Level Set Sign

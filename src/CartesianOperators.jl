@@ -825,6 +825,53 @@ end
     return inside
 end
 
+function _zero_padded_plane!(v::AbstractVector{T}, dims::NTuple{N,Int}, d::Int) where {N,T}
+    Nd = prod(dims)
+    sd = _stride(dims, d)
+    ld = dims[d]
+    block = sd * ld
+    nblocks = Nd ÷ block
+    z = zero(T)
+    @inbounds for outer in 0:(nblocks - 1)
+        base = outer * block
+        for off in 1:sd
+            last = base + off + (ld - 1) * sd
+            v[last] = z
+        end
+    end
+    return v
+end
+
+function _apply_lo_inflow_upwind!(F::AbstractVector{T},
+                                  state::AbstractVector{T},
+                                  a::AbstractVector{T},
+                                  u_node::AbstractVector{T},
+                                  dims::NTuple{N,Int},
+                                  d::Int,
+                                  bc_lo::AbstractAdvBC{T}) where {N,T}
+    ld = dims[d]
+    ld <= 2 && return F
+
+    Nd = prod(dims)
+    sd = _stride(dims, d)
+    block = sd * ld
+    nblocks = Nd ÷ block
+    z = zero(T)
+
+    @inbounds for outer in 0:(nblocks - 1)
+        base = outer * block
+        for off in 1:sd
+            idx = base + off + sd
+            ai = a[idx]
+            if ai >= z
+                F[idx] = ai * _ghost_lo(state[idx], u_node[idx], bc_lo)
+            end
+        end
+    end
+
+    return F
+end
+
 function shiftp!(y::AbstractVector, x::AbstractVector,
                  dims::NTuple{N,Int}, d::Int,
                  bc_lo::AbstractAdvBC{T}, bc_hi::AbstractAdvBC{T},
@@ -1270,20 +1317,11 @@ function _bulk_upwind1!(bulk::AbstractVector, ops::KernelConvectionOps{N,T}, d::
     @inbounds for i in 1:Nd
         a = Ad[i] * uωd[i]
         work.t2[i] = a >= zero(T) ? a * Tω[i] : a * work.t1[i]
+        work.t4[i] = a
     end
 
-    # Duplicated endpoint row is always inactive for advection flux arrays.
-    sd = _stride(ops.dims, d)
-    ld = ops.dims[d]
-    block = sd * ld
-    nblocks = Nd ÷ block
-    @inbounds for outer in 0:(nblocks - 1)
-        base = outer * block
-        for off in 1:sd
-            last = base + off + (ld - 1) * sd
-            work.t2[last] = zero(T)
-        end
-    end
+    _apply_lo_inflow_upwind!(work.t2, Tω, work.t4, uωd, ops.dims, d, ops.bc_adv.lo[d])
+    _zero_padded_plane!(work.t2, ops.dims, d)
 
     dp!(bulk, work.t2, ops.dims, d, blo, bhi)
     return bulk
@@ -1344,6 +1382,12 @@ function _bulk_muscl!(bulk::AbstractVector, ops::KernelConvectionOps{N,T}, d::In
             end
         end
     end
+
+    @inbounds for i in 1:Nd
+        work.t5[i] = Ad[i] * uωd[i]
+    end
+    _apply_lo_inflow_upwind!(work.t4, Tω, work.t5, uωd, ops.dims, d, bclo_adv)
+    _zero_padded_plane!(work.t4, ops.dims, d)
 
     dp!(bulk, work.t4, ops.dims, d, blo, bhi)
     return bulk
@@ -1449,13 +1493,18 @@ function _assembled_bulk_parts(cops::AssembledConvectionOps{N,T},
                                uω::NTuple{N,<:AbstractVector},
                                Tω::AbstractVector,
                                ::Upwind1) where {N,T}
-    z = zero(T)
     return ntuple(d -> begin
         a = cops.A[d] .* uω[d]
-        ap = max.(a, z)
-        am = min.(a, z)
-        Tr = cops.Splus[d] * Tω
-        F = ap .* Tω .+ am .* Tr
+        Tr = similar(Tω)
+        shiftp!(Tr, Tω, cops.dims, d, cops.bc_adv.lo[d], cops.bc_adv.hi[d], uω[d])
+        F = similar(Tω)
+        z = zero(T)
+        @inbounds for i in eachindex(Tω)
+            ai = a[i]
+            F[i] = ai >= z ? ai * Tω[i] : ai * Tr[i]
+        end
+        _apply_lo_inflow_upwind!(F, Tω, a, uω[d], cops.dims, d, cops.bc_adv.lo[d])
+        _zero_padded_plane!(F, cops.dims, d)
         cops.D_p[d] * F
     end, N)
 end

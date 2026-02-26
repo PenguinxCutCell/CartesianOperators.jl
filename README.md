@@ -52,3 +52,10 @@ convection_matrix(opsA, uω, uγ, Tω, Tγ; scheme=Upwind1())  # assembled debug
 convection!(out, opsK, uω, uγ, Tω, Tγ, work; scheme=Upwind1())
 convection!(out, opsK, uω, uγ, Tω, Tγ, work; scheme=MUSCL(MC()))
 ```
+
+`AdvInflow(value)` is applied where upwind selection needs a ghost state:
+
+- kernel: `Upwind1()` and `MUSCL(...)`
+- assembled: `Upwind1()`
+
+`Centered()` does not use inflow ghost values.
