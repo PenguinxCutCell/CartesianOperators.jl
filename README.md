@@ -39,16 +39,12 @@ Advection uses a separate BC container:
 Example:
 
 ```julia
-bc = BoxBC(
-    (Periodic{Float64}(),),
-    (Periodic{Float64}(),)
-)
 bc_adv = AdvBoxBC(
     (AdvPeriodic{Float64}(),),
     (AdvPeriodic{Float64}(),)
 )
-opsA = assembled_convection_ops(moments; bc=bc)
-opsK = kernel_convection_ops(moments; bc=bc, bc_adv=bc_adv)
+opsA = assembled_convection_ops(moments; bc_adv=bc_adv)
+opsK = kernel_convection_ops(moments; bc_adv=bc_adv)
 work = KernelWork(opsK)
 
 convection_matrix(opsA, uω, uγ, Tω, Tγ; scheme=Centered())

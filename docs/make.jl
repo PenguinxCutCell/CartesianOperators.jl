@@ -12,6 +12,7 @@ makedocs(
     ),
     pages = [
         "Home" => "index.md",
+        "Operators" => "operators.md",
         "Boundary Conditions" => "boundary-conditions.md",
         "API Reference" => "reference.md",
     ],

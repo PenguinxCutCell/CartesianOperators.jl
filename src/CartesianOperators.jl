@@ -15,6 +15,9 @@ export gradient!, divergence!, laplacian!
 export AssembledConvectionOps, KernelConvectionOps
 export assembled_convection_ops, kernel_convection_ops
 export build_convection_parts, convection_matrix, convection!
+export AssembledAdvectionDiffusionOps, KernelAdvectionDiffusionOps
+export assembled_advection_diffusion_ops, kernel_advection_diffusion_ops
+export advection_diffusion_matrix, advection_diffusion!
 export dm!, dmT!, dp!, sm!
 export apply_dirichlet_rows!, impose_dirichlet!
 
@@ -145,7 +148,7 @@ struct AssembledConvectionOps{N,T}
     B::NTuple{N,Vector{T}}
     dims::NTuple{N,Int}
     Nd::Int
-    bc::BoxBC{N,T}
+    bc_adv::AdvBoxBC{N,T}
 end
 
 struct KernelConvectionOps{N,T}
@@ -153,8 +156,19 @@ struct KernelConvectionOps{N,T}
     B::NTuple{N,Vector{T}}
     dims::NTuple{N,Int}
     Nd::Int
-    bc::BoxBC{N,T}
     bc_adv::AdvBoxBC{N,T}
+end
+
+struct AssembledAdvectionDiffusionOps{N,T}
+    diff::AssembledOps{N,T}
+    adv::AssembledConvectionOps{N,T}
+    κ::T
+end
+
+struct KernelAdvectionDiffusionOps{N,T}
+    diff::KernelOps{N,T}
+    adv::KernelConvectionOps{N,T}
+    κ::T
 end
 
 @inline function _pinv_w_entry(w::T) where {T<:Real}
@@ -287,15 +301,18 @@ function _advbc_mode(bc_lo::AbstractAdvBC{T}, bc_hi::AbstractAdvBC{T}) where {T}
     return plo ? :periodic : :standard
 end
 
-function _validate_convection_bc_pair(bc::BoxBC{N,T}, bc_adv::AdvBoxBC{N,T}) where {N,T}
-    for d in 1:N
-        topo_periodic = _bc_mode(bc.lo[d], bc.hi[d]) == :periodic
-        adv_periodic = _advbc_mode(bc_adv.lo[d], bc_adv.hi[d]) == :periodic
-        if topo_periodic != adv_periodic
-            throw(ArgumentError("convection requires periodic topology and advection BC to match in direction $d"))
-        end
-    end
-    return nothing
+@inline function _adv_to_stencil_bc(bc::AbstractAdvBC{T}) where {T}
+    return bc isa AdvPeriodic ? Periodic{T}() : Neumann{T}(zero(T))
+end
+
+@inline function _adv_stencil_pair(bc_lo::AbstractAdvBC{T}, bc_hi::AbstractAdvBC{T}) where {T}
+    return _adv_to_stencil_bc(bc_lo), _adv_to_stencil_bc(bc_hi)
+end
+
+function _boxbc_to_advbc(bc::BoxBC{N,T}) where {N,T}
+    lo = ntuple(d -> (_bc_mode(bc.lo[d], bc.hi[d]) == :periodic ? AdvPeriodic{T}() : AdvOutflow{T}()), N)
+    hi = ntuple(d -> (_bc_mode(bc.lo[d], bc.hi[d]) == :periodic ? AdvPeriodic{T}() : AdvOutflow{T}()), N)
+    return AdvBoxBC(lo, hi)
 end
 
 function MomentCapacity(m::GeometricMoments{N,T}; bc=nothing) where {N,T<:Real}
@@ -475,24 +492,86 @@ function KernelOps(cap::MomentCapacity{N,T}) where {N,T<:Real}
 end
 
 function AssembledConvectionOps(ops::AssembledOps{N,T}) where {N,T}
-    Splus = ntuple(d -> _build_operator(ops.dims, d, T,
-                                        n -> _shift_plus_1d(n, ops.bc.lo[d], ops.bc.hi[d], T)), N)
-    return AssembledConvectionOps{N,T}(ops.D_p, ops.S_m, Splus, ops.A, ops.B, ops.dims, ops.Nd, ops.bc)
+    bcadv = _boxbc_to_advbc(ops.bc)
+    return AssembledConvectionOps(ops.D_p, ops.S_m, ops.A, ops.B, ops.dims, ops.Nd, bcadv)
 end
 
-function AssembledConvectionOps(cap::MomentCapacity{N,T}) where {N,T}
-    return AssembledConvectionOps(AssembledOps(cap))
+function AssembledConvectionOps(D_p::NTuple{N,SparseMatrixCSC{T,Int}},
+                                S_m::NTuple{N,SparseMatrixCSC{T,Int}},
+                                A::NTuple{N,Vector{T}},
+                                B::NTuple{N,Vector{T}},
+                                dims::NTuple{N,Int},
+                                Nd::Int,
+                                bc_adv::AdvBoxBC{N,T}) where {N,T}
+    Splus = ntuple(d -> begin
+        blo, bhi = _adv_stencil_pair(bc_adv.lo[d], bc_adv.hi[d])
+        _build_operator(dims, d, T, n -> _shift_plus_1d(n, blo, bhi, T))
+    end, N)
+    return AssembledConvectionOps{N,T}(D_p, S_m, Splus, A, B, dims, Nd, bc_adv)
+end
+
+function AssembledConvectionOps(cap::MomentCapacity{N,T}; bc_adv=nothing) where {N,T}
+    bcadvT = _validate_advbc(_normalize_advbc(bc_adv, Val(N), T))
+    D_p = ntuple(d -> begin
+        blo, bhi = _adv_stencil_pair(bcadvT.lo[d], bcadvT.hi[d])
+        _build_operator(cap.dims, d, T, n -> _delta_p(n, blo, bhi, T))
+    end, N)
+    S_m = ntuple(d -> begin
+        periodic_d = _advbc_mode(bcadvT.lo[d], bcadvT.hi[d]) == :periodic
+        _build_operator(cap.dims, d, T, n -> _sigma_m(n, T; periodicity=periodic_d))
+    end, N)
+    return AssembledConvectionOps(D_p, S_m, cap.A, cap.B, cap.dims, cap.Nd, bcadvT)
 end
 
 function KernelConvectionOps(cap::MomentCapacity{N,T}; bc_adv=nothing) where {N,T}
     bcadvT = _validate_advbc(_normalize_advbc(bc_adv, Val(N), T))
-    _validate_convection_bc_pair(cap.bc, bcadvT)
-    return KernelConvectionOps{N,T}(cap.A, cap.B, cap.dims, cap.Nd, cap.bc, bcadvT)
+    return KernelConvectionOps{N,T}(cap.A, cap.B, cap.dims, cap.Nd, bcadvT)
 end
 
-assembled_convection_ops(m::GeometricMoments; bc=nothing) = AssembledConvectionOps(MomentCapacity(m; bc=bc))
-kernel_convection_ops(m::GeometricMoments; bc=nothing, bc_adv=nothing) =
-    KernelConvectionOps(MomentCapacity(m; bc=bc); bc_adv=bc_adv)
+function _check_ad_dims(diff::AssembledOps{N,T},
+                        adv::AssembledConvectionOps{N,T}) where {N,T}
+    diff.Nd == adv.Nd || throw(DimensionMismatch("diffusion Nd=$(diff.Nd) != advection Nd=$(adv.Nd)"))
+    diff.dims == adv.dims || throw(DimensionMismatch("diffusion/advection dims mismatch"))
+    return nothing
+end
+
+function _check_ad_dims(diff::KernelOps{N,T},
+                        adv::KernelConvectionOps{N,T}) where {N,T}
+    diff.Nd == adv.Nd || throw(DimensionMismatch("diffusion Nd=$(diff.Nd) != advection Nd=$(adv.Nd)"))
+    diff.dims == adv.dims || throw(DimensionMismatch("diffusion/advection dims mismatch"))
+    return nothing
+end
+
+function assembled_advection_diffusion_ops(m::GeometricMoments{N,T};
+                                           bc=nothing,
+                                           bc_adv=nothing,
+                                           κ=one(float(T))) where {N,T<:Real}
+    cap = MomentCapacity(m; bc=bc)
+    FT = eltype(cap.A[1])
+    κT = convert(FT, κ)
+    diff = AssembledOps(cap)
+    adv = AssembledConvectionOps(cap; bc_adv=bc_adv)
+    _check_ad_dims(diff, adv)
+    return AssembledAdvectionDiffusionOps{N,FT}(diff, adv, κT)
+end
+
+function kernel_advection_diffusion_ops(m::GeometricMoments{N,T};
+                                        bc=nothing,
+                                        bc_adv=nothing,
+                                        κ=one(float(T))) where {N,T<:Real}
+    cap = MomentCapacity(m; bc=bc)
+    FT = eltype(cap.A[1])
+    κT = convert(FT, κ)
+    diff = KernelOps(cap)
+    adv = KernelConvectionOps(cap; bc_adv=bc_adv)
+    _check_ad_dims(diff, adv)
+    return KernelAdvectionDiffusionOps{N,FT}(diff, adv, κT)
+end
+
+assembled_convection_ops(m::GeometricMoments; bc_adv=nothing) =
+    AssembledConvectionOps(MomentCapacity(m); bc_adv=bc_adv)
+kernel_convection_ops(m::GeometricMoments; bc_adv=nothing) =
+    KernelConvectionOps(MomentCapacity(m); bc_adv=bc_adv)
 
 KernelOps(m::GeometricMoments{N,T}; bc=nothing) where {N,T<:Real} = KernelOps(MomentCapacity(m; bc=bc))
 
@@ -1170,8 +1249,7 @@ function _bulk_centered!(bulk::AbstractVector, ops::KernelConvectionOps{N,T}, d:
                          work::KernelWork) where {N,T}
     Nd = ops.Nd
     Ad = ops.A[d]
-    blo = ops.bc.lo[d]
-    bhi = ops.bc.hi[d]
+    blo, bhi = _adv_stencil_pair(ops.bc_adv.lo[d], ops.bc_adv.hi[d])
 
     sm!(work.t1, Tω, ops.dims, d, blo, bhi)
     @inbounds for i in 1:Nd
@@ -1186,8 +1264,7 @@ function _bulk_upwind1!(bulk::AbstractVector, ops::KernelConvectionOps{N,T}, d::
                         work::KernelWork) where {N,T}
     Nd = ops.Nd
     Ad = ops.A[d]
-    blo = ops.bc.lo[d]
-    bhi = ops.bc.hi[d]
+    blo, bhi = _adv_stencil_pair(ops.bc_adv.lo[d], ops.bc_adv.hi[d])
 
     shiftp!(work.t1, Tω, ops.dims, d, ops.bc_adv.lo[d], ops.bc_adv.hi[d], uωd)
     @inbounds for i in 1:Nd
@@ -1217,8 +1294,7 @@ function _bulk_muscl!(bulk::AbstractVector, ops::KernelConvectionOps{N,T}, d::In
                       work::KernelWork, limiter::Limiter) where {N,T}
     Nd = ops.Nd
     Ad = ops.A[d]
-    blo = ops.bc.lo[d]
-    bhi = ops.bc.hi[d]
+    blo, bhi = _adv_stencil_pair(ops.bc_adv.lo[d], ops.bc_adv.hi[d])
     bclo_adv = ops.bc_adv.lo[d]
     bchi_adv = ops.bc_adv.hi[d]
     mode = _advbc_mode(bclo_adv, bchi_adv)
@@ -1303,8 +1379,7 @@ function _coupling_contribution!(out::AbstractVector, ops::KernelConvectionOps{N
     Nd = ops.Nd
     Ad = ops.A[d]
     Bd = ops.B[d]
-    blo = ops.bc.lo[d]
-    bhi = ops.bc.hi[d]
+    blo, bhi = _adv_stencil_pair(ops.bc_adv.lo[d], ops.bc_adv.hi[d])
 
     sm!(work.t1, Bd, ops.dims, d, blo, bhi)
     @inbounds for i in 1:Nd
@@ -1328,7 +1403,7 @@ end
     build_convection_parts(cops, uω, uγ, Tω, Tγ)
 
 Build per-dimension centered advection contributions (bulk and coupling) in assembled form.
-This uses periodic wrapping when requested by `cops.bc`; otherwise stencil rows are inactive
+This uses periodic wrapping when requested by `cops.bc_adv`; otherwise stencil rows are inactive
 at the padded boundary.
 """
 function build_convection_parts(cops::AssembledConvectionOps{N,T},
@@ -1465,6 +1540,64 @@ function convection!(out::AbstractVector, ops::KernelConvectionOps{N,T},
         _coupling_contribution!(out, ops, d, uγ[d], work.t5, work)
     end
 
+    return out
+end
+
+function advection_diffusion_matrix(adops::AssembledAdvectionDiffusionOps{N,T},
+                                    uω::NTuple{N,<:AbstractVector},
+                                    uγ::NTuple{N,<:AbstractVector},
+                                    Tω::AbstractVector,
+                                    Tγ::AbstractVector;
+                                    scheme::AdvectionScheme=Centered()) where {N,T}
+    L = laplacian_matrix(adops.diff, Tω, Tγ)
+    C = convection_matrix(adops.adv, uω, uγ, Tω, Tγ; scheme=scheme)
+    return adops.κ .* L .+ C
+end
+
+function advection_diffusion!(out::AbstractVector, adops::AssembledAdvectionDiffusionOps{N,T},
+                              uω::NTuple{N,<:AbstractVector},
+                              uγ::NTuple{N,<:AbstractVector},
+                              Tω::AbstractVector,
+                              Tγ::AbstractVector;
+                              scheme::AdvectionScheme=Centered()) where {N,T}
+    Nd = adops.diff.Nd
+    _check_length("out", length(out), Nd)
+    _check_velocity_tuple("uω", uω, Nd)
+    _check_velocity_tuple("uγ", uγ, Nd)
+    _check_scalar_pair(Nd, Tω, Tγ)
+
+    out .= adops.κ .* laplacian_matrix(adops.diff, Tω, Tγ)
+    out .+= convection_matrix(adops.adv, uω, uγ, Tω, Tγ; scheme=scheme)
+    return out
+end
+
+"""
+    advection_diffusion!(out, adops, uω, uγ, Tω, Tγ, ...; scheme=Centered())
+
+Compute `κ*Δ(Tω,Tγ) + convection(uω,uγ,Tω,Tγ)` in the sign convention used by
+`laplacian!` and `convection!`.
+"""
+function advection_diffusion!(out::AbstractVector, adops::KernelAdvectionDiffusionOps{N,T},
+                              uω::NTuple{N,<:AbstractVector},
+                              uγ::NTuple{N,<:AbstractVector},
+                              Tω::AbstractVector,
+                              Tγ::AbstractVector,
+                              work_diff::KernelWork,
+                              work_adv::KernelWork;
+                              scheme::AdvectionScheme=Centered()) where {N,T}
+    Nd = adops.diff.Nd
+    _check_length("out", length(out), Nd)
+    _check_velocity_tuple("uω", uω, Nd)
+    _check_velocity_tuple("uγ", uγ, Nd)
+    _check_scalar_pair(Nd, Tω, Tγ)
+    _check_work(work_diff, adops.diff)
+    _check_convection_work(work_adv, adops.adv)
+
+    laplacian!(work_diff.t4, adops.diff, Tω, Tγ, work_diff)
+    convection!(out, adops.adv, uω, uγ, Tω, Tγ, work_adv; scheme=scheme)
+    @inbounds for i in 1:Nd
+        out[i] += adops.κ * work_diff.t4[i]
+    end
     return out
 end
 

@@ -107,6 +107,59 @@ function affine_field(m, dims::NTuple{N,Int}) where {N}
     return x
 end
 
+@inline dx(m) = m.xyz[1][2] - m.xyz[1][1]
+@inline dy(m) = m.xyz[2][2] - m.xyz[2][1]
+
+function row_dict(L::AbstractMatrix, i::Int; tol=1e-13)
+    row = vec(Array(L[i, :]))
+    d = Dict{Int,Float64}()
+    @inbounds for j in eachindex(row)
+        v = row[j]
+        if abs(v) > tol
+            d[j] = v
+        end
+    end
+    return d
+end
+
+function assert_5pt_stencil(L::AbstractMatrix, i::Int, idx_center::Int, idx_w::Int, idx_e::Int, idx_s::Int, idx_n::Int;
+                            center_expected::Float64, west_expected::Float64, east_expected::Float64,
+                            south_expected::Float64, north_expected::Float64, tol=1e-12)
+    r = row_dict(L, i; tol=tol)
+    @test haskey(r, idx_center)
+    @test haskey(r, idx_w)
+    @test haskey(r, idx_e)
+    @test haskey(r, idx_s)
+    @test haskey(r, idx_n)
+
+    @test isapprox(r[idx_center], center_expected; atol=tol, rtol=tol)
+    @test isapprox(r[idx_w], west_expected; atol=tol, rtol=tol)
+    @test isapprox(r[idx_e], east_expected; atol=tol, rtol=tol)
+    @test isapprox(r[idx_s], south_expected; atol=tol, rtol=tol)
+    @test isapprox(r[idx_n], north_expected; atol=tol, rtol=tol)
+
+    expected = Set((idx_center, idx_w, idx_e, idx_s, idx_n))
+    @test all(in(expected), keys(r))
+end
+
+function enforce_periodic_duplicate_1d!(T::AbstractVector, dims::NTuple{1,Int})
+    li = LinearIndices(dims)
+    T[li[dims[1]]] = T[li[1]]
+    return T
+end
+
+function enforce_periodic_duplicate_2d!(T::AbstractVector, dims::NTuple{2,Int})
+    nx, ny = dims
+    li = LinearIndices(dims)
+    for j in 1:(ny - 1)
+        T[li[nx, j]] = T[li[1, j]]
+    end
+    for i in 1:nx
+        T[li[i, ny]] = T[li[i, 1]]
+    end
+    return T
+end
+
 function check_w_pseudoinverse(cap::MomentCapacity)
     N = length(cap.dims)
     for d in 1:N
@@ -466,16 +519,12 @@ end
 
 @testset "Convection Equivalence 2D Full" begin
     m = build_2d_full_moments()
-    bc = BoxBC(
-        (Periodic{Float64}(), Periodic{Float64}()),
-        (Periodic{Float64}(), Periodic{Float64}())
-    )
     bc_adv = AdvBoxBC(
         (AdvPeriodic{Float64}(), AdvPeriodic{Float64}()),
         (AdvPeriodic{Float64}(), AdvPeriodic{Float64}())
     )
-    copsA = assembled_convection_ops(m; bc=bc)
-    copsK = kernel_convection_ops(m; bc=bc, bc_adv=bc_adv)
+    copsA = assembled_convection_ops(m; bc_adv=bc_adv)
+    copsK = kernel_convection_ops(m; bc_adv=bc_adv)
     work = KernelWork(copsK)
 
     Nd = copsA.Nd
@@ -506,11 +555,11 @@ end
 
 @testset "Convection Coupling Off" begin
     m = build_2d_full_moments()
-    bc = BoxBC(
-        (Periodic{Float64}(), Neumann(0.0)),
-        (Periodic{Float64}(), Neumann(0.0))
+    bc_adv = AdvBoxBC(
+        (AdvPeriodic{Float64}(), AdvOutflow{Float64}()),
+        (AdvPeriodic{Float64}(), AdvOutflow{Float64}())
     )
-    copsA = assembled_convection_ops(m; bc=bc)
+    copsA = assembled_convection_ops(m; bc_adv=bc_adv)
 
     Nd = copsA.Nd
     N = length(copsA.dims)
@@ -534,16 +583,12 @@ end
 
 @testset "Convection Constant Field Periodic" begin
     m = build_2d_full_moments()
-    bc = BoxBC(
-        (Periodic{Float64}(), Periodic{Float64}()),
-        (Periodic{Float64}(), Periodic{Float64}())
-    )
     bc_adv = AdvBoxBC(
         (AdvPeriodic{Float64}(), AdvPeriodic{Float64}()),
         (AdvPeriodic{Float64}(), AdvPeriodic{Float64}())
     )
-    copsA = assembled_convection_ops(m; bc=bc)
-    copsK = kernel_convection_ops(m; bc=bc, bc_adv=bc_adv)
+    copsA = assembled_convection_ops(m; bc_adv=bc_adv)
+    copsK = kernel_convection_ops(m; bc_adv=bc_adv)
     work = KernelWork(copsK)
 
     Nd = copsA.Nd
@@ -565,16 +610,12 @@ end
 
 @testset "Convection Periodic Conservation" begin
     m = build_2d_full_moments()
-    bc = BoxBC(
-        (Periodic{Float64}(), Periodic{Float64}()),
-        (Periodic{Float64}(), Periodic{Float64}())
-    )
     bc_adv = AdvBoxBC(
         (AdvPeriodic{Float64}(), AdvPeriodic{Float64}()),
         (AdvPeriodic{Float64}(), AdvPeriodic{Float64}())
     )
-    copsA = assembled_convection_ops(m; bc=bc)
-    copsK = kernel_convection_ops(m; bc=bc, bc_adv=bc_adv)
+    copsA = assembled_convection_ops(m; bc_adv=bc_adv)
+    copsK = kernel_convection_ops(m; bc_adv=bc_adv)
     work = KernelWork(copsK)
 
     Nd = copsK.Nd
@@ -604,7 +645,7 @@ end
         (AdvPeriodic{Float64}(),),
         (AdvPeriodic{Float64}(),)
     )
-    copsK = kernel_convection_ops(m; bc=bc, bc_adv=bc_adv)
+    copsK = kernel_convection_ops(m; bc_adv=bc_adv)
     work = KernelWork(copsK)
 
     Nd = copsK.Nd
@@ -648,4 +689,336 @@ end
     trans_u = count(i -> (Tu[i] > 0.1 && Tu[i] < 0.9), phys)
     trans_m = count(i -> (Tm[i] > 0.1 && Tm[i] < 0.9), phys)
     @test trans_m ≤ trans_u
+end
+
+@testset "AdvectionDiffusion Equivalence 2D Full" begin
+    m = build_2d_full_moments()
+    bc = BoxBC(
+        (Periodic{Float64}(), Periodic{Float64}()),
+        (Periodic{Float64}(), Periodic{Float64}())
+    )
+    bc_adv = AdvBoxBC(
+        (AdvPeriodic{Float64}(), AdvPeriodic{Float64}()),
+        (AdvPeriodic{Float64}(), AdvPeriodic{Float64}())
+    )
+    κ = 0.7
+
+    aAD = assembled_advection_diffusion_ops(m; bc=bc, bc_adv=bc_adv, κ=κ)
+    kAD = kernel_advection_diffusion_ops(m; bc=bc, bc_adv=bc_adv, κ=κ)
+
+    Nd = aAD.diff.Nd
+    N = length(aAD.diff.dims)
+    phys = physical_indices(aAD.diff.dims)
+
+    workD = KernelWork(kAD.diff)
+    workA = KernelWork(kAD.adv)
+
+    Tω = randn(Nd)
+    Tγ = randn(Nd)
+    uω = ntuple(_ -> randn(Nd), N)
+    uγ = ntuple(_ -> randn(Nd), N)
+
+    outA = advection_diffusion_matrix(aAD, uω, uγ, Tω, Tγ; scheme=Upwind1())
+    outK = zeros(Nd)
+    advection_diffusion!(outK, kAD, uω, uγ, Tω, Tγ, workD, workA; scheme=Upwind1())
+    @test isapprox(outA, outK; atol=1e-13, rtol=1e-13)
+
+    LA = laplacian_matrix(aAD.diff, Tω, Tγ)
+    CA = convection_matrix(aAD.adv, uω, uγ, Tω, Tγ; scheme=Upwind1())
+    @test isapprox(outA, aAD.κ .* LA .+ CA; atol=1e-13, rtol=1e-13)
+
+    tmpL = zeros(Nd)
+    tmpC = zeros(Nd)
+    laplacian!(tmpL, kAD.diff, Tω, Tγ, workD)
+    convection!(tmpC, kAD.adv, uω, uγ, Tω, Tγ, workA; scheme=Upwind1())
+    @test isapprox(outK, kAD.κ .* tmpL .+ tmpC; atol=1e-13, rtol=1e-13)
+
+    uγ0 = ntuple(_ -> zeros(Nd), N)
+    outA0 = advection_diffusion_matrix(aAD, uω, uγ0, Tω, Tγ; scheme=Upwind1())
+    LA0 = laplacian_matrix(aAD.diff, Tω, Tγ)
+    CA0 = convection_matrix(aAD.adv, uω, uγ0, Tω, Tγ; scheme=Upwind1())
+    @test abs(sum(outA0[phys]) - (aAD.κ * sum(LA0[phys]) + sum(CA0[phys]))) ≤ 1e-11
+
+    Tconst = fill(1.5, Nd)
+    uωconst = ntuple(d -> fill(0.2 * d, Nd), N)
+    outConstA = advection_diffusion_matrix(aAD, uωconst, uγ0, Tconst, Tconst; scheme=Upwind1())
+    outConstK = zeros(Nd)
+    advection_diffusion!(outConstK, kAD, uωconst, uγ0, Tconst, Tconst, workD, workA; scheme=Upwind1())
+    @test isapprox(outConstA, outConstK; atol=1e-13, rtol=1e-13)
+    @test maximum(abs, outConstA[phys]) ≤ 1e-12
+end
+
+@testset "Laplacian stencil 5-point interior (full domain)" begin
+    x = collect(range(0.0, 1.0; length=7))
+    y = collect(range(0.0, 1.0; length=7))
+    full_domain(x, y, _=0) = -1.0
+    m = geometric_moments(full_domain, (x, y), Float64, zero; method=:implicitintegration)
+    bc = BoxBC(
+        (Periodic{Float64}(), Periodic{Float64}()),
+        (Periodic{Float64}(), Periodic{Float64}())
+    )
+    aops = assembled_ops(m; bc=bc)
+    L = copy(-aops.G' * aops.Winv * aops.G)
+
+    dims = aops.dims
+    li = LinearIndices(dims)
+    i, j = 3, 3
+    center = li[i, j]
+    west = li[i - 1, j]
+    east = li[i + 1, j]
+    south = li[i, j - 1]
+    north = li[i, j + 1]
+
+    assert_5pt_stencil(
+        L,
+        center,
+        center,
+        west,
+        east,
+        south,
+        north;
+        center_expected=-4.0,
+        west_expected=1.0,
+        east_expected=1.0,
+        south_expected=1.0,
+        north_expected=1.0,
+        tol=1e-12,
+    )
+end
+
+@testset "Laplacian boundary (Neumann0): constant and linear invariants" begin
+    m = build_2d_full_moments()
+    bc = BoxBC(Val(2), Float64)
+    aops = assembled_ops(m; bc=bc)
+    kops = kernel_ops(m; bc=bc)
+    work = KernelWork(kops)
+
+    Nd = aops.Nd
+    phys = physical_indices(aops.dims)
+    interior = strict_interior_indices(aops.dims)
+    xγ = zeros(Nd)
+
+    xconst = fill(2.0, Nd)
+    la = zeros(Nd)
+    lk = zeros(Nd)
+    laplacian!(la, aops, xconst, xγ)
+    laplacian!(lk, kops, xconst, xγ, work)
+    @test isapprox(la, lk; atol=1e-13, rtol=1e-13)
+    @test maximum(abs, la[phys]) ≤ 1e-12
+
+    xlin = affine_field(m, aops.dims)
+    laplacian!(la, aops, xlin, xγ)
+    laplacian!(lk, kops, xlin, xγ, work)
+    @test isapprox(la, lk; atol=1e-13, rtol=1e-13)
+    if !isempty(interior)
+        @test maximum(abs, la[interior]) ≤ 1e-12
+    end
+    @test maximum(abs, la[phys]) ≤ 1e3
+end
+
+@testset "Laplacian boundary (Dirichlet) row identity regression" begin
+    m = build_2d_outside_circle_moments()
+    u0 = 0.75
+    bc = BoxBC(
+        (Dirichlet(u0), Neumann(0.0)),
+        (Dirichlet(u0), Neumann(0.0))
+    )
+    aops = assembled_ops(m; bc=bc)
+
+    Nd = aops.Nd
+    xω = randn(Nd)
+    xγ = randn(Nd)
+    la = zeros(Nd)
+    laplacian!(la, aops, xω, xγ)
+
+    li = LinearIndices(aops.dims)
+    dir_idx = unique(vcat(
+        [li[1, j] for j in 1:aops.dims[2]],
+        [li[aops.dims[1], j] for j in 1:aops.dims[2]]
+    ))
+    @test maximum(abs, la[dir_idx] .- (xω[dir_idx] .- u0)) ≤ 1e-13
+
+    L = copy(-aops.G' * aops.Winv * aops.G)
+    rhs = zeros(Float64, Nd)
+    impose_dirichlet!(L, rhs, aops.dims, bc)
+    for i in dir_idx
+        row = vec(Array(L[i, :]))
+        @test isapprox(row[i], 1.0; atol=1e-13, rtol=0.0)
+        @test count(abs.(row) .> 1e-13) == 1
+        @test isapprox(rhs[i], u0; atol=1e-13, rtol=0.0)
+    end
+end
+
+@testset "Convection 1D sharp peak: boundedness over many steps" begin
+    m = build_1d_full_moments()
+    bc_adv = AdvBoxBC(
+        (AdvPeriodic{Float64}(),),
+        (AdvPeriodic{Float64}(),)
+    )
+    copsK = kernel_convection_ops(m; bc_adv=bc_adv)
+    work = KernelWork(copsK)
+
+    Nd = copsK.Nd
+    dims = copsK.dims
+    li = LinearIndices(dims)
+    phys = physical_indices(dims)
+
+    T0 = zeros(Float64, Nd)
+    for i in 1:(dims[1] - 1)
+        x = m.xyz[1][i]
+        T0[li[i]] = (x ≥ 0.35 && x ≤ 0.65) ? 1.0 : 0.0
+    end
+    enforce_periodic_duplicate_1d!(T0, dims)
+
+    uω = (fill(1.0, Nd),)
+    uγ = (zeros(Float64, Nd),)
+    Tγ = zeros(Float64, Nd)
+    conv = zeros(Float64, Nd)
+
+    maxu = maximum(abs, uω[1][phys])
+    dt = 0.45 * dx(m) / max(maxu, eps(Float64))
+    nsteps = 50
+    epsb = 1e-10
+
+    schemes = (Upwind1(), MUSCL(MC()), MUSCL(VanLeer()), MUSCL(Minmod()))
+    transitions = Dict{DataType,Int}()
+
+    for scheme in schemes
+        T = copy(T0)
+        for _ in 1:nsteps
+            convection!(conv, copsK, uω, uγ, T, Tγ, work; scheme=scheme)
+            @inbounds for p in phys
+                T[p] += dt * conv[p]
+            end
+            enforce_periodic_duplicate_1d!(T, dims)
+        end
+        @test all(isfinite, T[phys])
+        @test minimum(T[phys]) ≥ -epsb
+        @test maximum(T[phys]) ≤ 1 + epsb
+        transitions[typeof(scheme)] = count(p -> (T[p] > 0.1 && T[p] < 0.9), phys)
+    end
+
+    tup = transitions[Upwind1]
+    @test transitions[MUSCL{MC}] ≤ tup
+    @test transitions[MUSCL{VanLeer}] ≤ tup
+    @test transitions[MUSCL{Minmod}] ≤ tup
+end
+
+@testset "Convection 2D sharp peak: boundedness (periodic)" begin
+    m = build_2d_full_moments()
+    bc_adv = AdvBoxBC(
+        (AdvPeriodic{Float64}(), AdvPeriodic{Float64}()),
+        (AdvPeriodic{Float64}(), AdvPeriodic{Float64}())
+    )
+    copsK = kernel_convection_ops(m; bc_adv=bc_adv)
+    work = KernelWork(copsK)
+
+    Nd = copsK.Nd
+    dims = copsK.dims
+    li = LinearIndices(dims)
+    phys = physical_indices(dims)
+
+    T0 = zeros(Float64, Nd)
+    for i in 1:(dims[1] - 1), j in 1:(dims[2] - 1)
+        x = m.xyz[1][i]
+        y = m.xyz[2][j]
+        T0[li[i, j]] = (x ≥ 0.35 && x ≤ 0.65 && y ≥ 0.35 && y ≤ 0.65) ? 1.0 : 0.0
+    end
+    enforce_periodic_duplicate_2d!(T0, dims)
+
+    uω = (fill(1.0, Nd), fill(0.5, Nd))
+    uγ = (zeros(Float64, Nd), zeros(Float64, Nd))
+    Tγ = zeros(Float64, Nd)
+    conv = zeros(Float64, Nd)
+
+    dt = 0.4 * min(dx(m) / abs(1.0), dy(m) / abs(0.5))
+    nsteps = 20
+    epsb = 1e-10
+
+    for scheme in (Upwind1(), MUSCL(MC()))
+        T = copy(T0)
+        for _ in 1:nsteps
+            convection!(conv, copsK, uω, uγ, T, Tγ, work; scheme=scheme)
+            @inbounds for p in phys
+                T[p] += dt * conv[p]
+            end
+            enforce_periodic_duplicate_2d!(T, dims)
+        end
+        @test all(isfinite, T[phys])
+        @test minimum(T[phys]) ≥ -epsb
+        @test maximum(T[phys]) ≤ 1 + epsb
+    end
+end
+
+@testset "Convection sharp peak with interface moments: stability" begin
+    m = build_2d_moments()
+    bc_adv = AdvBoxBC(
+        (AdvPeriodic{Float64}(), AdvPeriodic{Float64}()),
+        (AdvPeriodic{Float64}(), AdvPeriodic{Float64}())
+    )
+    copsK = kernel_convection_ops(m; bc_adv=bc_adv)
+    work = KernelWork(copsK)
+
+    Nd = copsK.Nd
+    dims = copsK.dims
+    li = LinearIndices(dims)
+    phys = physical_indices(dims)
+
+    T0 = zeros(Float64, Nd)
+    for i in 1:(dims[1] - 1), j in 1:(dims[2] - 1)
+        x = m.xyz[1][i]
+        y = m.xyz[2][j]
+        T0[li[i, j]] = (x ≥ 0.35 && x ≤ 0.65 && y ≥ 0.35 && y ≤ 0.65) ? 1.0 : 0.0
+    end
+    enforce_periodic_duplicate_2d!(T0, dims)
+
+    uω = (fill(1.0, Nd), fill(0.5, Nd))
+    uγ = (zeros(Float64, Nd), zeros(Float64, Nd))
+    Tγ = zeros(Float64, Nd)
+    conv = zeros(Float64, Nd)
+
+    dt = 0.35 * min(dx(m) / abs(1.0), dy(m) / abs(0.5))
+    nsteps = 15
+    epsb = 1e-8
+
+    for scheme in (Upwind1(), MUSCL(MC()))
+        T = copy(T0)
+        for _ in 1:nsteps
+            convection!(conv, copsK, uω, uγ, T, Tγ, work; scheme=scheme)
+            @inbounds for p in phys
+                T[p] += dt * conv[p]
+            end
+            enforce_periodic_duplicate_2d!(T, dims)
+        end
+        @test all(isfinite, T[phys])
+        @test minimum(T[phys]) ≥ -epsb
+        @test maximum(T[phys]) ≤ 1 + epsb
+    end
+end
+
+@testset "Convection coupling term sanity near interface" begin
+    bc_adv = AdvBoxBC(
+        (AdvPeriodic{Float64}(), AdvPeriodic{Float64}()),
+        (AdvPeriodic{Float64}(), AdvPeriodic{Float64}())
+    )
+    for (name, m) in (("full", build_2d_full_moments()), ("circle", build_2d_moments()))
+        copsA = assembled_convection_ops(m; bc_adv=bc_adv)
+        Nd = copsA.Nd
+        N = length(copsA.dims)
+        phys = physical_indices(copsA.dims)
+
+        uω = ntuple(_ -> zeros(Float64, Nd), N)
+        uγ = (fill(0.3, Nd), fill(-0.2, Nd))
+        Tω = fill(2.0, Nd)
+        Tγ = fill(2.0, Nd)
+        out = convection_matrix(copsA, uω, uγ, Tω, Tγ; scheme=Upwind1())
+        @test all(isfinite, out[phys])
+        @test abs(sum(out[phys])) ≤ 1e-11
+        if name == "full"
+            @test maximum(abs, out[phys]) ≤ 1e-11
+        else
+            # Cut-cell geometry keeps the coupling conservative but not pointwise zero.
+            @test maximum(abs, out[phys]) > 1e-6
+        end
+    end
 end

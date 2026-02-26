@@ -48,21 +48,13 @@ This keeps interface machinery (`H`, `xγ`) unchanged.
 
 Advection uses a separate boundary container:
 
-- `AdvBoxBC` for hyperbolic inflow/outflow/periodic ghost states
-- `BoxBC` still defines periodic stencil topology for `D_p`/`S_m`
+- `AdvBoxBC` for hyperbolic inflow/outflow/periodic ghost states and advection stencil topology
 
 Available advection BCs:
 
 - `AdvOutflow` (default)
 - `AdvInflow(value)`
 - `AdvPeriodic`
-
-For periodic directions, both `BoxBC` and `AdvBoxBC` must be periodic on the same direction.
-
-Convection schemes:
-
-- Assembled path: `Centered()`, `Upwind1()`
-- Kernel path: `Centered()`, `Upwind1()`, `MUSCL(MC())`, `MUSCL(Minmod())`, `MUSCL(VanLeer())`
 
 Diffusion-style Dirichlet row replacement is **not** applied automatically to convection.
 
@@ -78,15 +70,10 @@ For exterior domains touching the box boundary, explicit box BC selection is ess
 ```@example
 using CartesianOperators
 
-bc = BoxBC(
-    (Periodic{Float64}(), Neumann(0.0)),
-    (Periodic{Float64}(), Dirichlet(1.0))
-)
-
 bc_adv = AdvBoxBC(
     (AdvPeriodic{Float64}(), AdvOutflow{Float64}()),
     (AdvPeriodic{Float64}(), AdvOutflow{Float64}())
 )
 
-bc isa BoxBC && bc_adv isa AdvBoxBC
+bc_adv isa AdvBoxBC
 ```
