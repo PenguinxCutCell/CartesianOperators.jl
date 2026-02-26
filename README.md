@@ -4,63 +4,127 @@
 ![CI](https://github.com/PenguinxCutCell/CartesianOperators.jl/actions/workflows/ci.yml/badge.svg)
 ![Coverage](https://codecov.io/gh/PenguinxCutCell/CartesianOperators.jl/branch/main/graph/badge.svg)
 
+`CartesianOperators.jl` provides Penguin-compatible Cartesian cut-cell operators from
+`CartesianGeometry.GeometricMoments` in both assembled sparse and matrix-free forms.
 
-Cartesian operators for cut-cell geometry with:
+## What is implemented
 
-- assembled sparse diffusion operators (`G`, `H`, `Winv`)
-- matrix-free diffusion kernels (`dm!`, `dmT!`, `gradient!`, `divergence!`, `laplacian!`)
-- scalar advection operators (`convection_matrix`, `convection!`) with coupling term `K`
+- Diffusion operators:
+  - assembled: `G`, `H`, `Winv`
+  - kernel: `dm!`, `dmT!`, `gradient!`, `divergence!`, `laplacian!`
+- Box boundary conditions for diffusion (`BoxBC`):
+  - default `Neumann(0)`
+  - `Periodic`
+  - `Dirichlet(value)` as row constraints
+- Hyperbolic scalar advection (`convection!`, `convection_matrix`) with schemes:
+  - `Centered()`
+  - `Upwind1()`
+  - `MUSCL(Minmod())`, `MUSCL(MC())`, `MUSCL(VanLeer())` (kernel path)
+- Separate advection BC (`AdvBoxBC`) with:
+  - `AdvOutflow` (default)
+  - `AdvPeriodic`
+  - `AdvInflow(value)`
+- Coupled advection-diffusion operator:
+  - `advection_diffusion!`
+  - `advection_diffusion_matrix`
+- Interface constraint operators (assembled + matrix-free residuals):
+  - Robin
+  - Flux jump
+  - Scalar jump
 
-## Box Boundary Conditions
+## Core algebra
 
-`assembled_ops(m; bc=...)` and `kernel_ops(m; bc=...)` support box BCs with:
+With bulk/interface unknowns `xω, xγ` and stacked directional fluxes:
 
-- default: `Neumann(0)` on all sides
-- `Periodic` per direction (must be set on both low/high sides)
-- `Dirichlet(value)` via constraint rows in Laplacian form
+- `gradient = Winv * (G*xω + H*xγ)`
+- `divergence = -(G' + H')*qω + H'*qγ`
+- `laplacian = -G' * Winv * (G*xω + H*xγ)`
 
-Example:
+## Quick start
 
 ```julia
-bc = BoxBC(
-    (Periodic{Float64}(), Neumann(0.0)),
-    (Periodic{Float64}(), Dirichlet(1.0))
-)
-ops = assembled_ops(moments; bc=bc)
-```
+using CartesianGeometry
+using CartesianOperators
 
-### Level-set sign and box BC relevance
+x = collect(range(0.0, 1.0; length=7))
+y = collect(range(0.0, 1.0; length=8))
+phi(x, y, _=0) = sqrt((x - 0.5)^2 + (y - 0.5)^2) - 0.3
 
-- Interior domain (e.g. `ϕ = r - r0`, so `ϕ < 0` inside a circle): box BC can be less critical if the active region does not touch the box boundary.
-- Exterior domain in a box (e.g. `ϕ = r0 - r`, so `ϕ < 0` outside the circle): the active region touches the box boundary, so explicit box BC choice is important.
+m = geometric_moments(phi, (x, y), Float64, zero; method=:implicitintegration)
 
-## Hyperbolic Advection BC and Schemes
-
-Advection uses a separate BC container:
-
-- `AdvBoxBC` for inflow/outflow/periodic ghosting
-- `BoxBC` still controls stencil topology (`D_p`, `S_m`) periodic seams
-
-Example:
-
-```julia
-bc_adv = AdvBoxBC(
-    (AdvPeriodic{Float64}(),),
-    (AdvPeriodic{Float64}(),)
-)
-opsA = assembled_convection_ops(moments; bc_adv=bc_adv)
-opsK = kernel_convection_ops(moments; bc_adv=bc_adv)
+# Diffusion operators
+opsA = assembled_ops(m)
+opsK = kernel_ops(m)
 work = KernelWork(opsK)
 
-convection_matrix(opsA, uω, uγ, Tω, Tγ; scheme=Centered())
-convection_matrix(opsA, uω, uγ, Tω, Tγ; scheme=Upwind1())  # assembled debug path
-convection!(out, opsK, uω, uγ, Tω, Tγ, work; scheme=Upwind1())
-convection!(out, opsK, uω, uγ, Tω, Tγ, work; scheme=MUSCL(MC()))
+Nd = opsA.Nd
+N = length(opsA.dims)
+xω = randn(Nd)
+xγ = randn(Nd)
+
+gA = zeros(N * Nd)
+gK = similar(gA)
+
+gradient!(gA, opsA, xω, xγ)
+gradient!(gK, opsK, xω, xγ, work)
+
+# Advection operators
+bc_adv = AdvBoxBC(
+    (AdvPeriodic{Float64}(), AdvPeriodic{Float64}()),
+    (AdvPeriodic{Float64}(), AdvPeriodic{Float64}())
+)
+
+copsA = assembled_convection_ops(m; bc_adv=bc_adv)
+copsK = kernel_convection_ops(m; bc_adv=bc_adv)
+workA = KernelWork(copsK)
+
+uω = ntuple(_ -> randn(Nd), N)
+uγ = ntuple(_ -> zeros(Nd), N)
+Tω = randn(Nd)
+Tγ = randn(Nd)
+
+out = zeros(Nd)
+convection!(out, copsK, uω, uγ, Tω, Tγ, workA; scheme=Upwind1())
 ```
 
-`AdvInflow(value)` is applied where upwind selection needs a ghost state:
+## Boundary-condition model
 
-- kernel: `Upwind1()` and `MUSCL(...)`
-- assembled: `Upwind1()`
+Diffusion and advection BC are intentionally separate:
 
-`Centered()` does not use inflow ghost values.
+- Diffusion uses `BoxBC` (`assembled_ops`, `kernel_ops`)
+- Advection uses `AdvBoxBC` (`assembled_convection_ops`, `kernel_convection_ops`)
+
+This avoids mixing elliptic Dirichlet/Neumann behavior with hyperbolic inflow/outflow.
+
+## Constraint operators
+
+Constraints are exposed as linear rows and matrix-free residuals:
+
+- assembled row form: `C*x - r`
+- matrix-free residual: `residual!(...)`
+
+Available builders:
+
+- `robin_constraint_row`, `robin_residual!`
+- `fluxjump_constraint_row`, `fluxjump_residual!`
+- `scalarjump_constraint_row`, `scalarjump_residual!`
+
+`interface_measure` from moments is used as the interface weighting (`Iγ`).
+
+## Notes on padded periodic layout
+
+For `dims[d] = n`, endpoint duplication is used:
+
+- physical dofs in that direction: `1:(n-1)`
+- index `n` duplicates index `1`
+
+So periodic seam wraps to `n-1`, and padded row `n` is inactive in difference/average-like operators.
+
+## Documentation
+
+- Dev docs: <https://PenguinxCutCell.github.io/CartesianOperators.jl/dev>
+- Local docs build:
+
+```julia
+julia --project=docs docs/make.jl
+```

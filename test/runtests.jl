@@ -107,6 +107,19 @@ function affine_field(m, dims::NTuple{N,Int}) where {N}
     return x
 end
 
+function x_coordinate_field(m, dims::NTuple{N,Int}) where {N}
+    li = LinearIndices(dims)
+    x = zeros(Float64, prod(dims))
+    for I in CartesianIndices(dims)
+        x[li[I]] = m.xyz[1][I[1]]
+    end
+    return x
+end
+
+function interface_indices(Igamma::AbstractVector; tol=1e-12)
+    return [i for i in eachindex(Igamma) if abs(Igamma[i]) > tol]
+end
+
 @inline dx(m) = m.xyz[1][2] - m.xyz[1][1]
 @inline dy(m) = m.xyz[2][2] - m.xyz[2][1]
 
@@ -183,6 +196,7 @@ function check_capacity_sanitized(cap::MomentCapacity)
         @test all(isfinite, cap.W[d])
         @test all(isfinite, cap.invW[d])
     end
+    @test all(isfinite, cap.Iγ)
 end
 
 function check_dm_kernels(ops::AssembledOps)
@@ -1073,4 +1087,301 @@ end
             @test maximum(abs, out[phys]) > 1e-6
         end
     end
+end
+
+@testset "Constraint Operators Full-Domain Interface Mask" begin
+    m = build_2d_full_moments()
+    aops = assembled_ops(m)
+    kops = kernel_ops(m)
+    work = KernelWork(kops)
+
+    Nd = aops.Nd
+    @test maximum(abs, aops.Iγ) == 0.0
+    @test maximum(abs, Iγ(kops)) == 0.0
+
+    xω = randn(Nd)
+    xγ = randn(Nd)
+
+    a = randn(Nd) .* aops.Iγ
+    b = randn(Nd) .* aops.Iγ
+    g = randn(Nd)
+
+    Cω, Cγ, r = robin_constraint_matrices(aops, a, b, g)
+    @test count(!iszero, Cω.nzval) == 0
+    @test count(!iszero, Cγ.nzval) == 0
+    @test maximum(abs, r) == 0.0
+
+    rr = zeros(Nd)
+    robin_residual!(rr, kops, a, b, g, xω, xγ, work)
+    @test maximum(abs, rr) == 0.0
+
+    b1 = randn(Nd) .* aops.Iγ
+    b2 = randn(Nd) .* aops.Iγ
+    Cω1, Cγ1, Cω2, Cγ2, rf = fluxjump_constraint_matrices(aops, aops, b1, b2, g)
+    @test count(!iszero, Cω1.nzval) == 0
+    @test count(!iszero, Cγ1.nzval) == 0
+    @test count(!iszero, Cω2.nzval) == 0
+    @test count(!iszero, Cγ2.nzval) == 0
+    @test maximum(abs, rf) == 0.0
+
+    fr = zeros(Nd)
+    work2 = KernelWork(kops)
+    fluxjump_residual!(fr, kops, kops, b1, b2, g, xω, xγ, xω, xγ, work, work2)
+    @test maximum(abs, fr) == 0.0
+
+    α1 = randn(Nd)
+    α2 = randn(Nd)
+    Cj1, Cj2, rt = scalarjump_constraint_matrices(aops, aops, α1, α2, g)
+    @test count(!iszero, Cj1.nzval) == 0
+    @test count(!iszero, Cj2.nzval) == 0
+    @test maximum(abs, rt) == 0.0
+
+    tr = zeros(Nd)
+    scalarjump_residual!(tr, kops, α1, α2, g, xγ, xγ)
+    @test maximum(abs, tr) == 0.0
+end
+
+@testset "Constraint Assembled vs Matrix-Free (Cut Geometry)" begin
+    m = build_2d_moments()
+    aops1 = assembled_ops(m)
+    aops2 = assembled_ops(m)
+    kops1 = kernel_ops(m)
+    kops2 = kernel_ops(m)
+    work1 = KernelWork(kops1)
+    work2 = KernelWork(kops2)
+
+    Nd = aops1.Nd
+    x1ω = randn(Nd)
+    x1γ = randn(Nd)
+    x2ω = randn(Nd)
+    x2γ = randn(Nd)
+
+    a = randn(Nd)
+    b = randn(Nd)
+    g = randn(Nd)
+    Cω, Cγ, rrhs = robin_constraint_matrices(aops1, a, b, g)
+    rA = Cω * x1ω + Cγ * x1γ - rrhs
+    rK = zeros(Nd)
+    robin_residual!(rK, kops1, a, b, g, x1ω, x1γ, work1)
+    @test isapprox(rA, rK; atol=1e-12, rtol=1e-12)
+
+    # Scalar constructor/broadcast convenience.
+    Cωs, Cγs, rs = robin_constraint_matrices(aops1, 1.2, -0.5, 0.3)
+    @test size(Cωs) == (Nd, Nd)
+    @test size(Cγs) == (Nd, Nd)
+    @test length(rs) == Nd
+
+    b1 = randn(Nd)
+    b2 = randn(Nd)
+    Cω1, Cγ1, Cω2, Cγ2, frhs = fluxjump_constraint_matrices(aops1, aops2, b1, b2, g)
+    fA = Cω1 * x1ω + Cγ1 * x1γ + Cω2 * x2ω + Cγ2 * x2γ - frhs
+    fK = zeros(Nd)
+    fluxjump_residual!(fK, kops1, kops2, b1, b2, g, x1ω, x1γ, x2ω, x2γ, work1, work2)
+    @test isapprox(fA, fK; atol=1e-12, rtol=1e-12)
+
+    α1 = randn(Nd)
+    α2 = randn(Nd)
+    Cj1, Cj2, trhs = scalarjump_constraint_matrices(aops1, aops2, α1, α2, g)
+    tA = Cj1 * x1γ + Cj2 * x2γ - trhs
+    tK = zeros(Nd)
+    scalarjump_residual!(tK, kops1, α1, α2, g, x1γ, x2γ)
+    @test isapprox(tA, tK; atol=1e-12, rtol=1e-12)
+
+    Cr, rr = robin_constraint_row(aops1, a, b, g)
+    @test size(Cr) == (Nd, 2 * Nd)
+    @test length(rr) == Nd
+
+    Cf, rf = fluxjump_constraint_row(aops1, aops2, b1, b2, g)
+    @test size(Cf) == (Nd, 4 * Nd)
+    @test length(rf) == Nd
+
+    Ct, rt = scalarjump_constraint_row(aops1, aops2, α1, α2, g)
+    @test size(Ct) == (Nd, 4 * Nd)
+    @test length(rt) == Nd
+end
+
+@testset "Robin Limits (Dirichlet/Neumann-like)" begin
+    m = build_2d_moments()
+    aops = assembled_ops(m)
+    kops = kernel_ops(m)
+    work = KernelWork(kops)
+
+    Nd = aops.Nd
+    xω = randn(Nd)
+    xγ = randn(Nd)
+    a = randn(Nd)
+    b = randn(Nd)
+    g = randn(Nd)
+
+    # b = 0 -> a*Iγ*xγ = Iγ*g
+    Cω0, Cγ0, r0 = robin_constraint_matrices(aops, a, zeros(Nd), g)
+    @test count(!iszero, Cω0.nzval) == 0
+    rA0 = Cγ0 * xγ - r0
+    ref0 = aops.Iγ .* (a .* xγ .- g)
+    @test isapprox(rA0, ref0; atol=1e-12, rtol=1e-12)
+    rK0 = zeros(Nd)
+    robin_residual!(rK0, kops, a, zeros(Nd), g, xω, xγ, work)
+    @test isapprox(rK0, ref0; atol=1e-12, rtol=1e-12)
+
+    # a = 0 -> b*H'W!(Gxω+Hxγ) = Iγ*g
+    Cω1, Cγ1, r1 = robin_constraint_matrices(aops, zeros(Nd), b, g)
+    rA1 = Cω1 * xω + Cγ1 * xγ - r1
+    q = gradient_matrix(aops, xω, xγ)
+    ref1 = b .* (aops.H' * q) .- aops.Iγ .* g
+    @test isapprox(rA1, ref1; atol=1e-12, rtol=1e-12)
+    rK1 = zeros(Nd)
+    robin_residual!(rK1, kops, zeros(Nd), b, g, xω, xγ, work)
+    @test isapprox(rK1, ref1; atol=1e-12, rtol=1e-12)
+end
+
+@testset "Constraint Sign: Constant Field Zero Flux" begin
+    m = build_2d_moments()
+    aops = assembled_ops(m)
+    kops = kernel_ops(m)
+    work = KernelWork(kops)
+
+    Nd = aops.Nd
+    xω = fill(1.75, Nd)
+    xγ = fill(1.75, Nd)
+
+    qA = aops.H' * (aops.Winv * (aops.G * xω + aops.H * xγ))
+    gradient!(work.g, kops, xω, xγ, work)
+    qK = zeros(Nd)
+    div_gamma!(qK, kops, work.g, work)
+
+    @test maximum(abs, qA) ≤ 1e-12
+    @test maximum(abs, qK) ≤ 1e-12
+    @test isapprox(qA, qK; atol=1e-12, rtol=1e-12)
+
+    a = zeros(Nd)
+    b = ones(Nd)
+    g = zeros(Nd)
+    Cω, Cγ, r = robin_constraint_matrices(aops, a, b, g)
+    rA = Cω * xω + Cγ * xγ - r
+    rK = zeros(Nd)
+    robin_residual!(rK, kops, a, b, g, xω, xγ, work)
+
+    @test maximum(abs, rA) ≤ 1e-12
+    @test maximum(abs, rK) ≤ 1e-12
+    @test isapprox(rA, rK; atol=1e-12, rtol=1e-12)
+end
+
+@testset "FluxJump Sign Symmetry and Identical-Field Limit" begin
+    m = build_2d_moments()
+    aops1 = assembled_ops(m)
+    aops2 = assembled_ops(m)
+    kops1 = kernel_ops(m)
+    kops2 = kernel_ops(m)
+    work1 = KernelWork(kops1)
+    work2 = KernelWork(kops2)
+
+    Nd = aops1.Nd
+    x1ω = randn(Nd)
+    x1γ = randn(Nd)
+    x2ω = randn(Nd)
+    x2γ = randn(Nd)
+    b1 = randn(Nd)
+    b2 = randn(Nd)
+    g0 = zeros(Nd)
+
+    Cω1, Cγ1, Cω2, Cγ2, r = fluxjump_constraint_matrices(aops1, aops2, b1, b2, g0)
+    r12A = Cω1 * x1ω + Cγ1 * x1γ + Cω2 * x2ω + Cγ2 * x2γ - r
+    Cω1s, Cγ1s, Cω2s, Cγ2s, rs = fluxjump_constraint_matrices(aops2, aops1, b2, b1, g0)
+    r21A = Cω1s * x2ω + Cγ1s * x2γ + Cω2s * x1ω + Cγ2s * x1γ - rs
+    @test isapprox(r12A, -r21A; atol=1e-12, rtol=1e-12)
+
+    r12K = zeros(Nd)
+    fluxjump_residual!(r12K, kops1, kops2, b1, b2, g0, x1ω, x1γ, x2ω, x2γ, work1, work2)
+    r21K = zeros(Nd)
+    fluxjump_residual!(r21K, kops2, kops1, b2, b1, g0, x2ω, x2γ, x1ω, x1γ, work2, work1)
+    @test isapprox(r12K, -r21K; atol=1e-12, rtol=1e-12)
+    @test isapprox(r12A, r12K; atol=1e-12, rtol=1e-12)
+
+    β = fill(1.3, Nd)
+    Cω1i, Cγ1i, Cω2i, Cγ2i, ri = fluxjump_constraint_matrices(aops1, aops2, β, β, g0)
+    rIdA = Cω1i * x1ω + Cγ1i * x1γ + Cω2i * x1ω + Cγ2i * x1γ - ri
+    rIdK = zeros(Nd)
+    fluxjump_residual!(rIdK, kops1, kops2, β, β, g0, x1ω, x1γ, x1ω, x1γ, work1, work2)
+    @test maximum(abs, rIdA) ≤ 1e-12
+    @test maximum(abs, rIdK) ≤ 1e-12
+end
+
+@testset "FluxJump Beta Contrast with Linear Field (Manufactured g)" begin
+    m = build_2d_moments()
+    aops = assembled_ops(m)
+    kops = kernel_ops(m)
+    work1 = KernelWork(kops)
+    work2 = KernelWork(kops)
+
+    Nd = aops.Nd
+    Iγv = aops.Iγ
+    mask = interface_indices(Iγv)
+    @test !isempty(mask)
+
+    xlin = x_coordinate_field(m, aops.dims)
+    z = zeros(Nd)
+    β1 = 0.7
+    β2 = 2.1
+    b1 = β1 .* Iγv
+    b2 = β2 .* Iγv
+
+    flux = aops.H' * gradient_matrix(aops, xlin, z)
+    g = (β2 - β1) .* flux
+    Cω1, Cγ1, Cω2, Cγ2, r = fluxjump_constraint_matrices(aops, aops, b1, b2, g)
+    rA = Cω1 * xlin + Cγ1 * z + Cω2 * xlin + Cγ2 * z - r
+    rK = zeros(Nd)
+    fluxjump_residual!(rK, kops, kops, b1, b2, g, xlin, z, xlin, z, work1, work2)
+
+    @test maximum(abs, rA[mask]) ≤ 1e-11
+    @test maximum(abs, rK[mask]) ≤ 1e-11
+    @test isapprox(rA, rK; atol=1e-11, rtol=1e-11)
+
+    gflip = -(β2 - β1) .* flux
+    rWrong = zeros(Nd)
+    fluxjump_residual!(rWrong, kops, kops, b1, b2, gflip, xlin, z, xlin, z, work1, work2)
+    @test maximum(abs, rWrong[mask]) > 1e-6
+end
+
+@testset "ScalarJump Exact Enforcement" begin
+    m = build_2d_moments()
+    aops1 = assembled_ops(m)
+    aops2 = assembled_ops(m)
+    kops = kernel_ops(m)
+
+    Nd = aops1.Nd
+    x1γ = randn(Nd)
+    x2γ = randn(Nd)
+    α1 = randn(Nd)
+    α2 = randn(Nd)
+    g = α2 .* x2γ .- α1 .* x1γ
+
+    Cj1, Cj2, r = scalarjump_constraint_matrices(aops1, aops2, α1, α2, g)
+    rA = Cj1 * x1γ + Cj2 * x2γ - r
+    rK = zeros(Nd)
+    scalarjump_residual!(rK, kops, α1, α2, g, x1γ, x2γ)
+
+    @test maximum(abs, rA) ≤ 1e-12
+    @test maximum(abs, rK) ≤ 1e-12
+    @test isapprox(rA, rK; atol=1e-12, rtol=1e-12)
+end
+
+@testset "H Adjoint and div_gamma Consistency" begin
+    m = build_2d_moments()
+    aops = assembled_ops(m)
+    kops = kernel_ops(m)
+    work = KernelWork(kops)
+
+    Nd = aops.Nd
+    N = length(aops.dims)
+    v = randn(Nd)
+    qγ = randn(N * Nd)
+
+    lhs = sum(v .* (aops.H' * qγ))
+    rhs = sum((aops.H * v) .* qγ)
+    @test isapprox(lhs, rhs; atol=1e-12, rtol=1e-12)
+
+    hqA = aops.H' * qγ
+    hqK = zeros(Nd)
+    div_gamma!(hqK, kops, qγ, work)
+    @test isapprox(hqA, hqK; atol=1e-12, rtol=1e-12)
 end

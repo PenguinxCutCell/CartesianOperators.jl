@@ -4,43 +4,47 @@ CurrentModule = CartesianOperators
 
 # CartesianOperators.jl
 
-## Installation
+`CartesianOperators.jl` builds Cartesian cut-cell operators from
+`CartesianGeometry.GeometricMoments`, matching Penguin algebra and indexing conventions.
 
-```julia
-using Pkg
-Pkg.add("CartesianOperators")
-```
+## Scope
 
-## Overview
+- Assembled sparse operators for diffusion (`G`, `H`, `Winv`)
+- Matrix-free kernels for diffusion (`dm!`, `dmT!`, `gradient!`, `divergence!`, `laplacian!`)
+- Centered/upwind/MUSCL scalar advection (`convection!`, `convection_matrix`)
+- Coupled advection-diffusion (`advection_diffusion!`, `advection_diffusion_matrix`)
+- Interface/boundary linear constraints (Robin, flux jump, scalar jump)
 
-`CartesianOperators.jl` builds Cartesian cut-cell operators from `CartesianGeometry.GeometricMoments` with two modes:
+## Data layout
 
-- Assembled sparse operators (`G`, `H`, `Winv`)
-- Matrix-free kernels (`dm!`, `dmT!`, `gradient!`, `divergence!`, `laplacian!`)
+Given `m::GeometricMoments{N,T}`:
 
-The package follows Penguin-compatible algebra. For a state vector `x = [xω; xγ]` (bulk and interface DOFs) and flux vector `q = [qω; qγ]` (bulk and interface fluxes):
+- `dims = ntuple(d -> length(m.xyz[d]), N)`
+- `Nd = prod(dims)`
+- vectors (`A[d]`, `B[d]`, `W[d]`, `interface_measure`) are length `Nd`
 
-- Gradient: `Winv * (G*xω + H*xγ)`
-- Divergence: `-(G' + H')*qω + H'*qγ`
-- Laplacian: `-G' * Winv * (G*xω + H*xγ)`
-- Scalar advection: centered (assembled + kernel) and upwind/MUSCL (kernel) with interface coupling `K`.
+Node-padded convention:
 
-Operators are built from:
-- Forward differences (`D_p` / `dp!`), Backward differences (`D_m` / `dm!`)
-- Forward averages (`S_p`), Backward averages (`S_m` / `sm!`)
-- Geometry fields (`A`, `B`, `Winv`) from `GeometricMoments`
-- Velocity fields for advection.
+- physical indices per direction are `1:(dims[d]-1)`
+- index `dims[d]` is the duplicated/padded layer
 
-## Quick Example
+## Core algebra
+
+For bulk/interface unknowns `(xω, xγ)` and fluxes `(qω, qγ)`:
+
+- `gradient = Winv * (G*xω + H*xγ)`
+- `divergence = -(G' + H')*qω + H'*qγ`
+- `laplacian = -G' * Winv * (G*xω + H*xγ)`
+
+## Quick start
 
 ```@example
 using CartesianGeometry
 using CartesianOperators
 
-x = collect(range(0.0, 1.0; length=9))
-y = collect(range(0.0, 1.0; length=10))
-phi(x, y, _=0) = sqrt((x - 0.5)^2 + (y - 0.5)^2) - 0.25
-
+x = collect(range(0.0, 1.0; length=7))
+y = collect(range(0.0, 1.0; length=8))
+phi(x, y, _=0) = sqrt((x - 0.5)^2 + (y - 0.5)^2) - 0.3
 m = geometric_moments(phi, (x, y), Float64, zero; method=:implicitintegration)
 
 opsA = assembled_ops(m)
@@ -49,25 +53,22 @@ work = KernelWork(opsK)
 
 Nd = opsA.Nd
 N = length(opsA.dims)
-
 xω = randn(Nd)
 xγ = randn(Nd)
-g1 = zeros(N * Nd)
-g2 = zeros(N * Nd)
 
-gradient!(g1, opsA, xω, xγ)
-gradient!(g2, opsK, xω, xγ, work)
+gA = zeros(N * Nd)
+gK = similar(gA)
+gradient!(gA, opsA, xω, xγ)
+gradient!(gK, opsK, xω, xγ, work)
 
-maximum(abs, g1 - g2)
+maximum(abs, gA - gK) < 1e-12
 ```
 
-## Notes
-
-- Node-padded layout is used: `Nd = prod(node_counts)`.
-- Physical cells are at indices `1:(node_counts[d]-1)` in each dimension.
-- Last layer per dimension is padded.
-
-## Main Sections
+## Navigation
 
 - [Boundary Conditions](boundary-conditions.md)
+- [Diffusion Operators](diffusion.md)
+- [Advection](advection.md)
+- [Advection-Diffusion](advection-diffusion.md)
+- [Constraints](constraints.md)
 - [API Reference](reference.md)

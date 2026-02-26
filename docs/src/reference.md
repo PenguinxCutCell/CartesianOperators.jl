@@ -10,6 +10,9 @@ CurrentModule = CartesianOperators
 Pages = ["reference.md"]
 ```
 
+## Full API
+
 ```@autodocs
 Modules = [CartesianOperators]
+Order = [:type, :function]
 ```

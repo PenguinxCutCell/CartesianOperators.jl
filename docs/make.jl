@@ -12,8 +12,11 @@ makedocs(
     ),
     pages = [
         "Home" => "index.md",
-        "Operators" => "operators.md",
+        "Diffusion Operators" => "diffusion.md",
         "Boundary Conditions" => "boundary-conditions.md",
+        "Advection" => "advection.md",
+        "Advection-Diffusion" => "advection-diffusion.md",
+        "Interface Constraints" => "constraints.md",
         "API Reference" => "reference.md",
     ],
     pagesonly = true,

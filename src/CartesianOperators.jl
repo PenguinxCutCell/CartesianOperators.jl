@@ -10,6 +10,7 @@ export AbstractAdvBC, AdvPeriodic, AdvOutflow, AdvInflow, AdvBoxBC
 export AdvectionScheme, Centered, Upwind1, MUSCL, Limiter, Minmod, MC, VanLeer
 export assembled_ops, kernel_ops, build_GHW
 export G, H, Winv, W!
+export Iγ
 export gradient_matrix, divergence_matrix, laplacian_matrix
 export gradient!, divergence!, laplacian!
 export AssembledConvectionOps, KernelConvectionOps
@@ -20,6 +21,11 @@ export assembled_advection_diffusion_ops, kernel_advection_diffusion_ops
 export advection_diffusion_matrix, advection_diffusion!
 export dm!, dmT!, dp!, sm!
 export apply_dirichlet_rows!, impose_dirichlet!
+export AbstractConstraint, RobinConstraint, FluxJumpConstraint, ScalarJumpConstraint
+export robin_constraint_matrices, robin_constraint_row
+export fluxjump_constraint_matrices, fluxjump_constraint_row
+export scalarjump_constraint_matrices, scalarjump_constraint_row
+export div_gamma!, robin_residual!, fluxjump_residual!, scalarjump_residual!
 
 abstract type AbstractBC{T} end
 
@@ -97,11 +103,32 @@ struct MUSCL{L<:Limiter} <: AdvectionScheme
     limiter::L
 end
 
+abstract type AbstractConstraint end
+
+struct RobinConstraint{T} <: AbstractConstraint
+    a::Vector{T}
+    b::Vector{T}
+    g::Vector{T}
+end
+
+struct FluxJumpConstraint{T} <: AbstractConstraint
+    b1::Vector{T}
+    b2::Vector{T}
+    g::Vector{T}
+end
+
+struct ScalarJumpConstraint{T} <: AbstractConstraint
+    α1::Vector{T}
+    α2::Vector{T}
+    g::Vector{T}
+end
+
 struct MomentCapacity{N,T}
     A::NTuple{N,Vector{T}}
     B::NTuple{N,Vector{T}}
     W::NTuple{N,Vector{T}}
     invW::NTuple{N,Vector{T}}
+    Iγ::Vector{T}
     dims::NTuple{N,Int}
     Nd::Int
     bc::BoxBC{N,T}
@@ -117,6 +144,7 @@ struct AssembledOps{N,T}
     S_p::NTuple{N,SparseMatrixCSC{T,Int}}
     A::NTuple{N,Vector{T}}
     B::NTuple{N,Vector{T}}
+    Iγ::Vector{T}
     dims::NTuple{N,Int}
     Nd::Int
     bc::BoxBC{N,T}
@@ -126,6 +154,7 @@ struct KernelOps{N,T}
     A::NTuple{N,Vector{T}}
     B::NTuple{N,Vector{T}}
     invW::NTuple{N,Vector{T}}
+    Iγ::Vector{T}
     dims::NTuple{N,Int}
     Nd::Int
     bc::BoxBC{N,T}
@@ -196,6 +225,68 @@ end
 function _check_length(name::AbstractString, n::Int, expected::Int)
     n == expected || throw(DimensionMismatch("$name has length $n, expected $expected"))
     return nothing
+end
+
+_diag(v::AbstractVector{T}) where {T} = spdiagm(0 => v)
+
+@inline function _constraint_vector(name::AbstractString, v::AbstractVector{T}, Nd::Int) where {T}
+    _check_length(name, length(v), Nd)
+    return v
+end
+
+@inline function _constraint_vector(name::AbstractString, v::T, Nd::Int) where {T<:Real}
+    return fill(v, Nd)
+end
+
+@inline function _constraint_vector(name::AbstractString, v, Nd::Int)
+    v isa Real && return fill(v, Nd)
+    v isa AbstractVector && return _constraint_vector(name, v, Nd)
+    throw(ArgumentError("$name must be a scalar or vector, got $(typeof(v))"))
+end
+
+function RobinConstraint(a::AbstractVector{T}, b::AbstractVector{T}, g::AbstractVector{T}) where {T}
+    n = length(a)
+    _check_length("b", length(b), n)
+    _check_length("g", length(g), n)
+    return RobinConstraint{T}(collect(a), collect(b), collect(g))
+end
+
+function RobinConstraint(a, b, g, Nd::Int)
+    av = _constraint_vector("a", a, Nd)
+    bv = _constraint_vector("b", b, Nd)
+    gv = _constraint_vector("g", g, Nd)
+    T = promote_type(eltype(av), eltype(bv), eltype(gv))
+    return RobinConstraint(convert(Vector{T}, av), convert(Vector{T}, bv), convert(Vector{T}, gv))
+end
+
+function FluxJumpConstraint(b1::AbstractVector{T}, b2::AbstractVector{T}, g::AbstractVector{T}) where {T}
+    n = length(b1)
+    _check_length("b2", length(b2), n)
+    _check_length("g", length(g), n)
+    return FluxJumpConstraint{T}(collect(b1), collect(b2), collect(g))
+end
+
+function FluxJumpConstraint(b1, b2, g, Nd::Int)
+    b1v = _constraint_vector("b1", b1, Nd)
+    b2v = _constraint_vector("b2", b2, Nd)
+    gv = _constraint_vector("g", g, Nd)
+    T = promote_type(eltype(b1v), eltype(b2v), eltype(gv))
+    return FluxJumpConstraint(convert(Vector{T}, b1v), convert(Vector{T}, b2v), convert(Vector{T}, gv))
+end
+
+function ScalarJumpConstraint(α1::AbstractVector{T}, α2::AbstractVector{T}, g::AbstractVector{T}) where {T}
+    n = length(α1)
+    _check_length("α2", length(α2), n)
+    _check_length("g", length(g), n)
+    return ScalarJumpConstraint{T}(collect(α1), collect(α2), collect(g))
+end
+
+function ScalarJumpConstraint(α1, α2, g, Nd::Int)
+    α1v = _constraint_vector("α1", α1, Nd)
+    α2v = _constraint_vector("α2", α2, Nd)
+    gv = _constraint_vector("g", g, Nd)
+    T = promote_type(eltype(α1v), eltype(α2v), eltype(gv))
+    return ScalarJumpConstraint(convert(Vector{T}, α1v), convert(Vector{T}, α2v), convert(Vector{T}, gv))
 end
 
 _is_periodic(bc::AbstractBC) = bc isa Periodic
@@ -323,17 +414,19 @@ function MomentCapacity(m::GeometricMoments{N,T}; bc=nothing) where {N,T<:Real}
     A = ntuple(d -> _sanitize!(FT.(m.A[d])), N)
     B = ntuple(d -> _sanitize!(FT.(m.B[d])), N)
     W = ntuple(d -> _sanitize!(FT.(m.W[d])), N)
+    Iγ = _sanitize!(FT.(m.interface_measure))
 
     for d in 1:N
         _check_length("A[$d]", length(A[d]), Nd)
         _check_length("B[$d]", length(B[d]), Nd)
         _check_length("W[$d]", length(W[d]), Nd)
     end
+    _check_length("interface_measure", length(Iγ), Nd)
 
     invW = ntuple(d -> _pinv_w(W[d]), N)
     bcT = _validate_bc(_normalize_bc(bc, Val(N), FT))
 
-    return MomentCapacity{N,FT}(A, B, W, invW, dims, Nd, bcT)
+    return MomentCapacity{N,FT}(A, B, W, invW, Iγ, dims, Nd, bcT)
 end
 
 function _I(n::Int, ::Type{T}) where {T<:Real}
@@ -482,13 +575,13 @@ function AssembledOps(cap::MomentCapacity{N,T}) where {N,T<:Real}
     H = reduce(vcat, H_parts)
     Winv = spdiagm(0 => vcat(cap.invW...))
 
-    return AssembledOps{N,T}(G, H, Winv, D_m, D_p, S_m, S_p, cap.A, cap.B, cap.dims, cap.Nd, cap.bc)
+    return AssembledOps{N,T}(G, H, Winv, D_m, D_p, S_m, S_p, cap.A, cap.B, cap.Iγ, cap.dims, cap.Nd, cap.bc)
 end
 
 AssembledOps(m::GeometricMoments{N,T}; bc=nothing) where {N,T<:Real} = AssembledOps(MomentCapacity(m; bc=bc))
 
 function KernelOps(cap::MomentCapacity{N,T}) where {N,T<:Real}
-    return KernelOps{N,T}(cap.A, cap.B, cap.invW, cap.dims, cap.Nd, cap.bc)
+    return KernelOps{N,T}(cap.A, cap.B, cap.invW, cap.Iγ, cap.dims, cap.Nd, cap.bc)
 end
 
 function AssembledConvectionOps(ops::AssembledOps{N,T}) where {N,T}
@@ -597,6 +690,8 @@ G(ops::AssembledOps) = ops.G
 H(ops::AssembledOps) = ops.H
 Winv(ops::AssembledOps) = ops.Winv
 W!(ops::AssembledOps) = ops.Winv
+Iγ(ops::AssembledOps) = _diag(ops.Iγ)
+Iγ(ops::KernelOps) = ops.Iγ
 
 function _check_dm_args(y::AbstractVector, x::AbstractVector,
                         dims::NTuple{N,Int}, d::Int) where {N}
@@ -1109,6 +1204,251 @@ function laplacian!(out::AbstractVector, ops::AssembledOps,
     out .= laplacian_matrix(ops, xω, xγ)
     return out
 end
+
+function robin_constraint_matrices(
+    ops::AssembledOps{N,T},
+    a,
+    b,
+    g,
+) where {N,T}
+    Nd = ops.Nd
+    av = T.(_constraint_vector("a", a, Nd))
+    bv = T.(_constraint_vector("b", b, Nd))
+    gv = T.(_constraint_vector("g", g, Nd))
+
+    Ia = _diag(av)
+    Ib = _diag(bv)
+    Iγd = _diag(ops.Iγ)
+
+    Cω = Ib * (ops.H' * (ops.Winv * ops.G))
+    Cγ = Ia * Iγd + Ib * (ops.H' * (ops.Winv * ops.H))
+    r = ops.Iγ .* gv
+    return Cω, Cγ, r
+end
+
+robin_constraint_matrices(ops::AssembledOps, c::RobinConstraint) =
+    robin_constraint_matrices(ops, c.a, c.b, c.g)
+
+function robin_constraint_row(ops::AssembledOps, a, b, g)
+    Cω, Cγ, r = robin_constraint_matrices(ops, a, b, g)
+    C = sparse(hcat(Cω, Cγ))
+    return C, r
+end
+
+robin_constraint_row(ops::AssembledOps, c::RobinConstraint) =
+    robin_constraint_row(ops, c.a, c.b, c.g)
+
+function fluxjump_constraint_matrices(
+    ops1::AssembledOps{N,T},
+    ops2::AssembledOps{N,T},
+    b1,
+    b2,
+    g,
+) where {N,T}
+    Nd = ops1.Nd
+    ops2.Nd == Nd || throw(DimensionMismatch("ops1/ops2 Nd mismatch"))
+
+    b1v = T.(_constraint_vector("b1", b1, Nd))
+    b2v = T.(_constraint_vector("b2", b2, Nd))
+    gv = T.(_constraint_vector("g", g, Nd))
+
+    Ib1 = _diag(b1v)
+    Ib2 = _diag(b2v)
+
+    Cω1 = -Ib1 * (ops1.H' * (ops1.Winv * ops1.G))
+    Cγ1 = -Ib1 * (ops1.H' * (ops1.Winv * ops1.H))
+    Cω2 =  Ib2 * (ops2.H' * (ops2.Winv * ops2.G))
+    Cγ2 =  Ib2 * (ops2.H' * (ops2.Winv * ops2.H))
+
+    r = ops1.Iγ .* gv
+    return Cω1, Cγ1, Cω2, Cγ2, r
+end
+
+fluxjump_constraint_matrices(ops1::AssembledOps, ops2::AssembledOps, c::FluxJumpConstraint) =
+    fluxjump_constraint_matrices(ops1, ops2, c.b1, c.b2, c.g)
+
+function fluxjump_constraint_row(ops1::AssembledOps, ops2::AssembledOps, b1, b2, g)
+    Cω1, Cγ1, Cω2, Cγ2, r = fluxjump_constraint_matrices(ops1, ops2, b1, b2, g)
+    C = sparse(hcat(Cω1, Cγ1, Cω2, Cγ2))
+    return C, r
+end
+
+fluxjump_constraint_row(ops1::AssembledOps, ops2::AssembledOps, c::FluxJumpConstraint) =
+    fluxjump_constraint_row(ops1, ops2, c.b1, c.b2, c.g)
+
+function scalarjump_constraint_matrices(
+    ops1::AssembledOps{N,T},
+    ops2::AssembledOps{N,T},
+    α1,
+    α2,
+    g,
+) where {N,T}
+    Nd = ops1.Nd
+    ops2.Nd == Nd || throw(DimensionMismatch("ops1/ops2 Nd mismatch"))
+
+    α1v = T.(_constraint_vector("α1", α1, Nd))
+    α2v = T.(_constraint_vector("α2", α2, Nd))
+    gv = T.(_constraint_vector("g", g, Nd))
+
+    Cγ1 = _diag(-ops1.Iγ .* α1v)
+    Cγ2 = _diag( ops1.Iγ .* α2v)
+    r = ops1.Iγ .* gv
+    return Cγ1, Cγ2, r
+end
+
+scalarjump_constraint_matrices(ops1::AssembledOps, ops2::AssembledOps, c::ScalarJumpConstraint) =
+    scalarjump_constraint_matrices(ops1, ops2, c.α1, c.α2, c.g)
+
+function scalarjump_constraint_row(ops1::AssembledOps{N,T}, ops2::AssembledOps{N,T}, α1, α2, g) where {N,T}
+    Cγ1, Cγ2, r = scalarjump_constraint_matrices(ops1, ops2, α1, α2, g)
+    Nd = ops1.Nd
+    Z = spzeros(T, Nd, Nd)
+    C = sparse(hcat(Z, Cγ1, Z, Cγ2))
+    return C, r
+end
+
+scalarjump_constraint_row(ops1::AssembledOps, ops2::AssembledOps, c::ScalarJumpConstraint) =
+    scalarjump_constraint_row(ops1, ops2, c.α1, c.α2, c.g)
+
+function div_gamma!(out::AbstractVector, ops::KernelOps{N},
+                    qγ::AbstractVector, work::KernelWork) where {N}
+    Nd = ops.Nd
+    _check_length("qγ", length(qγ), N * Nd)
+    _check_length("out", length(out), Nd)
+    _check_work(work, ops)
+
+    fill!(out, zero(eltype(out)))
+
+    @inbounds for d in 1:N
+        Ad = ops.A[d]
+        Bd = ops.B[d]
+        off = (d - 1) * Nd
+
+        copyto!(work.t1, 1, qγ, off + 1, Nd)
+        for i in 1:Nd
+            work.t1[i] = Ad[i] * work.t1[i]
+        end
+        dmT!(work.t2, work.t1, ops.dims, d, ops.bc.lo[d], ops.bc.hi[d])
+        for i in 1:Nd
+            out[i] += work.t2[i]
+        end
+
+        copyto!(work.t1, 1, qγ, off + 1, Nd)
+        dmT!(work.t2, work.t1, ops.dims, d, ops.bc.lo[d], ops.bc.hi[d])
+        for i in 1:Nd
+            out[i] -= Bd[i] * work.t2[i]
+        end
+    end
+
+    return out
+end
+
+function robin_residual!(
+    out::AbstractVector{T},
+    ops::KernelOps{N,T},
+    a,
+    b,
+    g,
+    xω::AbstractVector{T},
+    xγ::AbstractVector{T},
+    work::KernelWork{T},
+) where {N,T}
+    Nd = ops.Nd
+    _check_length("out", length(out), Nd)
+    _check_length("xω", length(xω), Nd)
+    _check_length("xγ", length(xγ), Nd)
+    _check_work(work, ops)
+
+    av = T.(_constraint_vector("a", a, Nd))
+    bv = T.(_constraint_vector("b", b, Nd))
+    gv = T.(_constraint_vector("g", g, Nd))
+
+    gradient!(work.g, ops, xω, xγ, work)
+    div_gamma!(out, ops, work.g, work)
+
+    @inbounds for i in 1:Nd
+        out[i] = av[i] * ops.Iγ[i] * xγ[i] + bv[i] * out[i] - ops.Iγ[i] * gv[i]
+    end
+    return out
+end
+
+robin_residual!(out::AbstractVector{T}, ops::KernelOps{N,T}, c::RobinConstraint{T},
+                xω::AbstractVector{T}, xγ::AbstractVector{T}, work::KernelWork{T}) where {N,T} =
+    robin_residual!(out, ops, c.a, c.b, c.g, xω, xγ, work)
+
+function fluxjump_residual!(
+    out::AbstractVector{T},
+    ops1::KernelOps{N,T},
+    ops2::KernelOps{N,T},
+    b1,
+    b2,
+    g,
+    x1ω::AbstractVector{T},
+    x1γ::AbstractVector{T},
+    x2ω::AbstractVector{T},
+    x2γ::AbstractVector{T},
+    work1::KernelWork{T},
+    work2::KernelWork{T},
+) where {N,T}
+    Nd = ops1.Nd
+    ops2.Nd == Nd || throw(DimensionMismatch("ops1/ops2 Nd mismatch"))
+    _check_length("out", length(out), Nd)
+    _check_length("x1ω", length(x1ω), Nd)
+    _check_length("x1γ", length(x1γ), Nd)
+    _check_length("x2ω", length(x2ω), Nd)
+    _check_length("x2γ", length(x2γ), Nd)
+    _check_work(work1, ops1)
+    _check_work(work2, ops2)
+
+    b1v = T.(_constraint_vector("b1", b1, Nd))
+    b2v = T.(_constraint_vector("b2", b2, Nd))
+    gv = T.(_constraint_vector("g", g, Nd))
+
+    gradient!(work1.g, ops1, x1ω, x1γ, work1)
+    div_gamma!(work1.t3, ops1, work1.g, work1)
+    gradient!(work2.g, ops2, x2ω, x2γ, work2)
+    div_gamma!(work2.t3, ops2, work2.g, work2)
+
+    @inbounds for i in 1:Nd
+        out[i] = b2v[i] * work2.t3[i] - b1v[i] * work1.t3[i] - ops1.Iγ[i] * gv[i]
+    end
+    return out
+end
+
+fluxjump_residual!(out::AbstractVector{T}, ops1::KernelOps{N,T}, ops2::KernelOps{N,T},
+                   c::FluxJumpConstraint{T},
+                   x1ω::AbstractVector{T}, x1γ::AbstractVector{T},
+                   x2ω::AbstractVector{T}, x2γ::AbstractVector{T},
+                   work1::KernelWork{T}, work2::KernelWork{T}) where {N,T} =
+    fluxjump_residual!(out, ops1, ops2, c.b1, c.b2, c.g, x1ω, x1γ, x2ω, x2γ, work1, work2)
+
+function scalarjump_residual!(
+    out::AbstractVector{T},
+    ops::KernelOps{N,T},
+    α1,
+    α2,
+    g,
+    x1γ::AbstractVector{T},
+    x2γ::AbstractVector{T},
+) where {N,T}
+    Nd = ops.Nd
+    _check_length("out", length(out), Nd)
+    _check_length("x1γ", length(x1γ), Nd)
+    _check_length("x2γ", length(x2γ), Nd)
+
+    α1v = T.(_constraint_vector("α1", α1, Nd))
+    α2v = T.(_constraint_vector("α2", α2, Nd))
+    gv = T.(_constraint_vector("g", g, Nd))
+
+    @inbounds for i in 1:Nd
+        out[i] = ops.Iγ[i] * (α2v[i] * x2γ[i] - α1v[i] * x1γ[i] - gv[i])
+    end
+    return out
+end
+
+scalarjump_residual!(out::AbstractVector{T}, ops::KernelOps{N,T}, c::ScalarJumpConstraint{T},
+                   x1γ::AbstractVector{T}, x2γ::AbstractVector{T}) where {N,T} =
+    scalarjump_residual!(out, ops, c.α1, c.α2, c.g, x1γ, x2γ)
 
 function _check_kernel_inputs(ops::KernelOps{N}, out::AbstractVector,
                               xω::AbstractVector, xγ::AbstractVector) where {N}
