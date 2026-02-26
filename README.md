@@ -1,5 +1,10 @@
 # CartesianOperators.jl
 
+[![In development documentation](https://img.shields.io/badge/docs-dev-blue.svg)](https://PenguinxCutCell.github.io/CartesianOperators.jl/dev)
+![CI](https://github.com/PenguinxCutCell/CartesianOperators.jl/actions/workflows/ci.yml/badge.svg)
+![Coverage](https://codecov.io/gh/PenguinxCutCell/CartesianOperators.jl/branch/main/graph/badge.svg)
+
+
 Cartesian operators for cut-cell geometry with:
 
 - assembled sparse diffusion operators (`G`, `H`, `Winv`)
