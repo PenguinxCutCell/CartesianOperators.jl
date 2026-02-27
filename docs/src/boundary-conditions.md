@@ -16,6 +16,8 @@ Constructors:
 
 - `BoxBC(Val(N), T)` default all-Neumann(0)
 - `BoxBC(lo_tuple, hi_tuple)` explicit side-by-side setup
+- `Dirichlet(Ref(value))` for time-varying scalar payloads
+- `Dirichlet(values::Vector)` for space-varying full-index payloads
 
 Example:
 
@@ -38,6 +40,12 @@ Optional strong-row utilities are still available:
 
 - `impose_dirichlet!(A, rhs, dims, bc)` for assembled matrices
 - `apply_dirichlet_rows!(out, x, dims, bc)` for residual-row style forms
+
+Stable helper API for physics packages:
+
+- `dirichlet_mask_values(dims, bc)` -> mask + current values
+- `dirichlet_values_vector!(out, dims, bc)` -> boundary values with zero interior
+- `copy_with_dirichlet!(dest, src, dims, bc)` -> state copy with boundary injection
 
 In the node-padded layout, Dirichlet is imposed on **physical boundary layers**:
 

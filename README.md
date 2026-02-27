@@ -16,6 +16,7 @@
   - default `Neumann(0)`
   - `Periodic`
   - `Dirichlet(value)` via ghost-state elimination (with explicit RHS contribution)
+  - updateable payloads: `Dirichlet(Ref(value))`, `Dirichlet(full_vector)`
 - Hyperbolic scalar advection (`convection!`, `convection_matrix`) with schemes:
   - `Centered()`
   - `Upwind1()`
@@ -99,6 +100,12 @@ This avoids mixing elliptic Dirichlet/Neumann behavior with hyperbolic inflow/ou
 For diffusion with `Dirichlet(value)`, the default Laplacian path keeps PDE rows and
 injects boundary values through ghost elimination. If needed, strong row replacement is
 still available explicitly with `impose_dirichlet!`.
+
+Boundary helper API (exported):
+
+- `dirichlet_mask_values(dims, bc)`
+- `dirichlet_values_vector!(out, dims, bc)`
+- `copy_with_dirichlet!(dest, src, dims, bc)`
 
 ## Constraint operators
 

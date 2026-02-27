@@ -96,34 +96,7 @@ end
 function apply_box_dirichlet_state!(x::AbstractVector{T},
                                     dims::NTuple{N,Int},
                                     bc::BoxBC{N,T}) where {N,T}
-    Nd = prod(dims)
-    @assert length(x) == Nd
-    for d in 1:N
-        sd = d == 1 ? 1 : prod(dims[1:(d - 1)])
-        ld = dims[d]
-        block = sd * ld
-        nblocks = Nd ÷ block
-        if bc.lo[d] isa Dirichlet{T}
-            u = (bc.lo[d]::Dirichlet{T}).u
-            for outer in 0:(nblocks - 1)
-                base = outer * block
-                for off in 1:sd
-                    x[base + off] = u
-                end
-            end
-        end
-        if bc.hi[d] isa Dirichlet{T}
-            u = (bc.hi[d]::Dirichlet{T}).u
-            hoff = ld > 1 ? (ld - 2) * sd : 0
-            for outer in 0:(nblocks - 1)
-                base = outer * block
-                for off in 1:sd
-                    x[base + off + hoff] = u
-                end
-            end
-        end
-    end
-    return x
+    return copy_with_dirichlet!(x, x, dims, bc)
 end
 
 function affine_field(m, dims::NTuple{N,Int}) where {N}
@@ -576,6 +549,52 @@ end
         @test count(abs.(row) .> 1e-13) == 1
         @test isapprox(rhs[i], u0; atol=1e-13, rtol=0.0)
     end
+end
+
+@testset "Dirichlet payload helpers and updateability" begin
+    m = build_2d_full_moments()
+    dims = ntuple(d -> length(m.xyz[d]), 2)
+    Nd = prod(dims)
+    li = LinearIndices(dims)
+
+    lo_ref = Ref(1.25)
+    hi_vec = collect(range(-1.0, 1.0; length=Nd))
+    bc = BoxBC(
+        (Dirichlet(lo_ref), Neumann(0.0)),
+        (Dirichlet(hi_vec), Neumann(0.0))
+    )
+
+    mask, vals = dirichlet_mask_values(dims, bc)
+    lo_idx = [li[1, j] for j in 1:dims[2]]
+    hi_idx = [li[dims[1] - 1, j] for j in 1:dims[2]]
+    pad_hi_idx = [li[dims[1], j] for j in 1:dims[2]]
+
+    @test all(mask[i] for i in lo_idx)
+    @test all(vals[i] == lo_ref[] for i in lo_idx)
+    @test all(mask[i] for i in hi_idx)
+    @test all(vals[i] == hi_vec[i] for i in hi_idx)
+    @test all(!mask[i] for i in pad_hi_idx)
+
+    x = randn(Nd)
+    x_api = copy(x)
+    copy_with_dirichlet!(x_api, x, dims, bc)
+    x_ref = copy(x)
+    apply_box_dirichlet_state!(x_ref, dims, bc)
+    @test isapprox(x_api, x_ref; atol=1e-13, rtol=1e-13)
+
+    vals_vec = zeros(Float64, Nd)
+    dirichlet_values_vector!(vals_vec, dims, bc)
+    @test all(vals_vec[i] == vals[i] for i in eachindex(vals_vec) if mask[i])
+    @test all(vals_vec[i] == 0.0 for i in eachindex(vals_vec) if !mask[i])
+
+    lo_side = bc.lo[1]::Dirichlet{Float64}
+    hi_side = bc.hi[1]::Dirichlet{Float64}
+    set!(lo_side.u, 2.0)
+    set!(hi_side.u, fill(3.0, Nd))
+
+    _, vals2 = dirichlet_mask_values(dims, bc)
+    @test all(vals2[i] == 2.0 for i in lo_idx)
+    @test all(vals2[i] == 3.0 for i in hi_idx)
 end
 
 @testset "Convection Equivalence 2D Full" begin

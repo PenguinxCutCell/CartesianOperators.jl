@@ -6,6 +6,7 @@ using CartesianGeometry: GeometricMoments
 
 export MomentCapacity, AssembledOps, KernelOps, KernelWork
 export AbstractBC, Neumann, Dirichlet, Periodic, BoxBC
+export AbstractBCPayload, ScalarPayload, RefPayload, VecPayload, bcvalue, set!
 export AbstractAdvBC, AdvPeriodic, AdvOutflow, AdvInflow, AdvBoxBC
 export AdvectionScheme, Centered, Upwind1, MUSCL, Limiter, Minmod, MC, VanLeer
 export assembled_ops, kernel_ops, build_GHW
@@ -22,6 +23,7 @@ export advection_diffusion_matrix, advection_diffusion!
 export dm!, dmT!, dp!, sm!
 export apply_dirichlet_rows!, impose_dirichlet!
 export dirichlet_rhs, dirichlet_rhs!
+export dirichlet_mask_values, dirichlet_values_vector!, copy_with_dirichlet!
 export AbstractConstraint, RobinConstraint, FluxJumpConstraint, ScalarJumpConstraint
 export robin_constraint_matrices, robin_constraint_row
 export fluxjump_constraint_matrices, fluxjump_constraint_row
@@ -30,17 +32,65 @@ export div_gamma!, robin_residual!, fluxjump_residual!, scalarjump_residual!
 
 abstract type AbstractBC{T} end
 
+abstract type AbstractBCPayload{T} end
+
+struct ScalarPayload{T} <: AbstractBCPayload{T}
+    value::T
+end
+
+struct RefPayload{T} <: AbstractBCPayload{T}
+    value::Base.RefValue{T}
+end
+
+struct VecPayload{T} <: AbstractBCPayload{T}
+    values::Vector{T}
+end
+
+ScalarPayload(v::T) where {T<:Real} = ScalarPayload{T}(v)
+RefPayload(v::Base.RefValue{T}) where {T<:Real} = RefPayload{T}(v)
+VecPayload(v::AbstractVector{T}) where {T<:Real} = VecPayload{T}(collect(v))
+
+@inline bcvalue(p::ScalarPayload{T}, _idx::Int) where {T} = p.value
+@inline bcvalue(p::RefPayload{T}, _idx::Int) where {T} = p.value[]
+@inline function bcvalue(p::VecPayload{T}, idx::Int) where {T}
+    1 <= idx <= length(p.values) || throw(DimensionMismatch("VecPayload index $idx is out of bounds for length $(length(p.values))"))
+    return p.values[idx]
+end
+
+@inline set!(p::RefPayload{T}, value) where {T} = (p.value[] = convert(T, value); p)
+
+function set!(p::VecPayload{T}, values::AbstractVector) where {T}
+    length(values) == length(p.values) || throw(DimensionMismatch("VecPayload update length $(length(values)) does not match payload length $(length(p.values))"))
+    @inbounds for i in eachindex(p.values)
+        p.values[i] = convert(T, values[i])
+    end
+    return p
+end
+
+@inline function set!(p::VecPayload{T}, value) where {T}
+    v = convert(T, value)
+    fill!(p.values, v)
+    return p
+end
+
+set!(::ScalarPayload, _) = throw(ArgumentError("ScalarPayload is immutable; use RefPayload or VecPayload for updateable Dirichlet values"))
+
 struct Neumann{T} <: AbstractBC{T}
     g::T
 end
 
-struct Dirichlet{T} <: AbstractBC{T}
-    u::T
+struct Dirichlet{T,P<:AbstractBCPayload{T}} <: AbstractBC{T}
+    u::P
 end
 
 struct Periodic{T} <: AbstractBC{T} end
 
 Periodic(::Type{T}) where {T} = Periodic{T}()
+
+Dirichlet(u::T) where {T<:Real} = Dirichlet{T,ScalarPayload{T}}(ScalarPayload{T}(u))
+Dirichlet(u::Base.RefValue{T}) where {T<:Real} = Dirichlet{T,RefPayload{T}}(RefPayload{T}(u))
+Dirichlet(u::AbstractVector{T}) where {T<:Real} = Dirichlet{T,VecPayload{T}}(VecPayload{T}(u))
+Dirichlet(u::AbstractBCPayload{T}) where {T<:Real} = Dirichlet{T,typeof(u)}(u)
 
 struct BoxBC{N,T}
     lo::NTuple{N,AbstractBC{T}}
@@ -298,8 +348,14 @@ function _convert_bc(::Type{T}, bc::Neumann) where {T}
     return Neumann{T}(T(bc.g))
 end
 
-function _convert_bc(::Type{T}, bc::Dirichlet) where {T}
-    return Dirichlet{T}(T(bc.u))
+_convert_payload(::Type{T}, p::ScalarPayload{S}) where {T,S} = ScalarPayload{T}(convert(T, p.value))
+_convert_payload(::Type{T}, p::RefPayload{T}) where {T} = p
+_convert_payload(::Type{T}, p::VecPayload{T}) where {T} = p
+_convert_payload(::Type{T}, p::RefPayload{S}) where {T,S} = RefPayload{T}(Ref{T}(convert(T, p.value[])))
+_convert_payload(::Type{T}, p::VecPayload{S}) where {T,S} = VecPayload{T}(convert(Vector{T}, p.values))
+
+function _convert_bc(::Type{T}, bc::Dirichlet{S,P}) where {T,S,P}
+    return Dirichlet(_convert_payload(T, bc.u))
 end
 
 function _convert_bc(::Type{T}, ::Periodic) where {T}
@@ -1066,11 +1122,12 @@ function _dirichlet_mask_values(dims::NTuple{N,Int}, bc::BoxBC{N,T}) where {N,T}
         nblocks = Nd ÷ block
 
         if bc.lo[d] isa Dirichlet{T}
-            u = (bc.lo[d]::Dirichlet{T}).u
+            payload = (bc.lo[d]::Dirichlet{T}).u
             @inbounds for outer in 0:(nblocks - 1)
                 base = outer * block
                 for off in 1:sd
                     idx = base + off
+                    u = bcvalue(payload, idx)
                     if mask[idx] && vals[idx] != u
                         throw(ArgumentError("conflicting Dirichlet values at boundary node $idx"))
                     end
@@ -1081,13 +1138,14 @@ function _dirichlet_mask_values(dims::NTuple{N,Int}, bc::BoxBC{N,T}) where {N,T}
         end
 
         if bc.hi[d] isa Dirichlet{T}
-            u = (bc.hi[d]::Dirichlet{T}).u
+            payload = (bc.hi[d]::Dirichlet{T}).u
             @inbounds for outer in 0:(nblocks - 1)
                 base = outer * block
                 for off in 1:sd
                     # Dirichlet is imposed on the last physical layer (ld-1).
                     # The final layer ld is padded/ghost in this node-padded layout.
                     idx = ld > 1 ? (base + off + (ld - 2) * sd) : (base + off)
+                    u = bcvalue(payload, idx)
                     if mask[idx] && vals[idx] != u
                         throw(ArgumentError("conflicting Dirichlet values at boundary node $idx"))
                     end
@@ -1123,22 +1181,24 @@ function _apply_dirichlet_values!(x::AbstractVector{T},
         nblocks = Nd ÷ block
 
         if bc.lo[d] isa Dirichlet{T}
-            u = (bc.lo[d]::Dirichlet{T}).u
+            payload = (bc.lo[d]::Dirichlet{T}).u
             for outer in 0:(nblocks - 1)
                 base = outer * block
                 for off in 1:sd
-                    x[base + off] = u
+                    idx = base + off
+                    x[idx] = bcvalue(payload, idx)
                 end
             end
         end
 
         if bc.hi[d] isa Dirichlet{T}
-            u = (bc.hi[d]::Dirichlet{T}).u
             hoff = ld > 1 ? (ld - 2) * sd : 0
+            payload = (bc.hi[d]::Dirichlet{T}).u
             for outer in 0:(nblocks - 1)
                 base = outer * block
                 for off in 1:sd
-                    x[base + off + hoff] = u
+                    idx = base + off + hoff
+                    x[idx] = bcvalue(payload, idx)
                 end
             end
         end
@@ -1160,6 +1220,15 @@ function _copy_with_dirichlet!(dest::AbstractVector{T},
     return _apply_dirichlet_values!(dest, dims, bc)
 end
 
+dirichlet_mask_values(dims::NTuple{N,Int}, bc::BoxBC{N,T}) where {N,T} =
+    _dirichlet_mask_values(dims, bc)
+
+copy_with_dirichlet!(dest::AbstractVector{T},
+                     src::AbstractVector,
+                     dims::NTuple{N,Int},
+                     bc::BoxBC{N,T}) where {N,T} =
+    _copy_with_dirichlet!(dest, src, dims, bc)
+
 function _dirichlet_values_vector!(out::AbstractVector{T},
                                    dims::NTuple{N,Int},
                                    bc::BoxBC{N,T}) where {N,T}
@@ -1170,13 +1239,18 @@ function _dirichlet_values_vector!(out::AbstractVector{T},
     return out
 end
 
+dirichlet_values_vector!(out::AbstractVector{T},
+                         dims::NTuple{N,Int},
+                         bc::BoxBC{N,T}) where {N,T} =
+    _dirichlet_values_vector!(out, dims, bc)
+
 function apply_dirichlet_rows!(out::AbstractVector, x::AbstractVector,
                                dims::NTuple{N,Int}, bc::BoxBC{N,T}) where {N,T}
     Nd = prod(dims)
     _check_length("out", length(out), Nd)
     _check_length("x", length(x), Nd)
 
-    mask, vals = _dirichlet_mask_values(dims, bc)
+    mask, vals = dirichlet_mask_values(dims, bc)
     @inbounds for i in eachindex(mask)
         if mask[i]
             out[i] = x[i] - vals[i]
@@ -1192,7 +1266,7 @@ function impose_dirichlet!(A::SparseMatrixCSC{T,Int}, rhs::AbstractVector,
     size(A, 2) == n || throw(DimensionMismatch("A has $(size(A,2)) cols, expected $n"))
     _check_length("rhs", length(rhs), n)
 
-    mask, vals = _dirichlet_mask_values(dims, bc)
+    mask, vals = dirichlet_mask_values(dims, bc)
 
     # For each column j, zero A[i,j] for all Dirichlet i
     @inbounds for j in 1:n
@@ -1245,7 +1319,7 @@ function laplacian_matrix(ops::AssembledOps{N,T}, xω::AbstractVector, xγ::Abst
         return laplacian_matrix(ops.G, ops.H, ops.Winv, xω, xγ)
     end
     xωeff = Vector{T}(undef, ops.Nd)
-    _copy_with_dirichlet!(xωeff, xω, ops.dims, ops.bc)
+    copy_with_dirichlet!(xωeff, xω, ops.dims, ops.bc)
     return laplacian_matrix(ops.G, ops.H, ops.Winv, xωeff, xγ)
 end
 
@@ -1652,7 +1726,7 @@ function laplacian!(out::AbstractVector, ops::KernelOps{N},
 
     xωeff = xω
     if _has_dirichlet(ops.bc)
-        _copy_with_dirichlet!(work.t4, xω, ops.dims, ops.bc)
+        copy_with_dirichlet!(work.t4, xω, ops.dims, ops.bc)
         xωeff = work.t4
     end
 
@@ -1682,7 +1756,7 @@ function dirichlet_rhs!(out::AbstractVector{T}, ops::AssembledOps{N,T}) where {N
         return out
     end
 
-    _dirichlet_values_vector!(out, ops.dims, ops.bc)
+    dirichlet_values_vector!(out, ops.dims, ops.bc)
     tmp = ops.G * out
     tmp = ops.Winv * tmp
     out .= -(ops.G' * tmp)
@@ -1704,7 +1778,7 @@ function dirichlet_rhs!(out::AbstractVector{T},
         return out
     end
 
-    _dirichlet_values_vector!(work.t4, ops.dims, ops.bc)   # xω boundary values, zero interior
+    dirichlet_values_vector!(work.t4, ops.dims, ops.bc)    # xω boundary values, zero interior
     fill!(work.t3, zero(T))                                # xγ = 0
     laplacian!(out, ops, work.t4, work.t3, work)
     return out
