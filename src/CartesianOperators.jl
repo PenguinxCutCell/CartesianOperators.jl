@@ -8,6 +8,7 @@ export MomentCapacity, AssembledOps, KernelOps, KernelWork
 export AbstractBC, Neumann, Dirichlet, Periodic, BoxBC
 export AbstractBCPayload, ScalarPayload, RefPayload, VecPayload, bcvalue, set!
 export AbstractAdvBC, AdvPeriodic, AdvOutflow, AdvInflow, AdvBoxBC
+export AbstractEmbeddedAdvBC, NoEmbeddedAdvBC, EmbeddedInflow, embedded_trace_upwind!
 export AdvectionScheme, Centered, Upwind1, MUSCL, Limiter, Minmod, MC, VanLeer
 export assembled_ops, kernel_ops, build_GHW
 export G, H, Winv, W!
@@ -139,6 +140,24 @@ function AdvBoxBC(::Val{N}, ::Type{T}) where {N,T}
     hi = ntuple(_ -> AdvOutflow{T}(), N)
     return AdvBoxBC{N,T}(lo, hi)
 end
+
+abstract type AbstractEmbeddedAdvBC{T} end
+
+struct NoEmbeddedAdvBC{T} <: AbstractEmbeddedAdvBC{T} end
+NoEmbeddedAdvBC(::Type{T}) where {T} = NoEmbeddedAdvBC{T}()
+
+struct EmbeddedInflow{T,P<:AbstractBCPayload{T},F} <: AbstractEmbeddedAdvBC{T}
+    Tbc::P
+    fun::F
+end
+
+function EmbeddedInflow(payload::AbstractBCPayload{T}; fun=nothing) where {T<:Real}
+    return EmbeddedInflow{T,typeof(payload),typeof(fun)}(payload, fun)
+end
+
+EmbeddedInflow(value::T; fun=nothing) where {T<:Real} = EmbeddedInflow(ScalarPayload(value); fun=fun)
+EmbeddedInflow(value::Base.RefValue{T}; fun=nothing) where {T<:Real} = EmbeddedInflow(RefPayload(value); fun=fun)
+EmbeddedInflow(values::AbstractVector{T}; fun=nothing) where {T<:Real} = EmbeddedInflow(VecPayload(values); fun=fun)
 
 abstract type AdvectionScheme end
 
@@ -389,6 +408,15 @@ function _convert_advbc(::Type{T}, bc::AdvInflow) where {T}
     return AdvInflow{T}(T(bc.value))
 end
 
+function _convert_embedded_advbc(::Type{T}, ::NoEmbeddedAdvBC) where {T}
+    return NoEmbeddedAdvBC{T}()
+end
+
+function _convert_embedded_advbc(::Type{T}, bc::EmbeddedInflow{S,P,F}) where {T,S,P,F}
+    payload = _convert_payload(T, bc.Tbc)
+    return EmbeddedInflow(payload; fun=bc.fun)
+end
+
 function _normalize_advbc(::Nothing, ::Val{N}, ::Type{T}) where {N,T}
     return AdvBoxBC(Val(N), T)
 end
@@ -401,6 +429,12 @@ end
 
 function _normalize_advbc(bc_adv, ::Val{N}, ::Type{T}) where {N,T}
     throw(ArgumentError("bc_adv must be nothing or AdvBoxBC{$N,<:Real}, got $(typeof(bc_adv))"))
+end
+
+_normalize_embedded_advbc(::Nothing, ::Type{T}) where {T} = NoEmbeddedAdvBC{T}()
+_normalize_embedded_advbc(bc::AbstractEmbeddedAdvBC, ::Type{T}) where {T} = _convert_embedded_advbc(T, bc)
+function _normalize_embedded_advbc(bc, ::Type{T}) where {T}
+    throw(ArgumentError("embedded advection BC must be nothing or AbstractEmbeddedAdvBC, got $(typeof(bc))"))
 end
 
 function _validate_bc(bc::BoxBC{N,T}) where {N,T}
@@ -1982,6 +2016,132 @@ function _check_scalar_pair(Nd::Int, Tω::AbstractVector, Tγ::AbstractVector)
     return nothing
 end
 
+@inline function _is_interface_cell(meas::T, tol::T) where {T}
+    return isfinite(meas) && meas > tol
+end
+
+function _fill_embedded_tbc!(out::AbstractVector{T},
+                             bc::EmbeddedInflow{T},
+                             moments::GeometricMoments{N,T},
+                             t::T) where {N,T}
+    if bc.fun !== nothing
+        f = bc.fun
+        if applicable(f, out, moments, t)
+            f(out, moments, t)
+            return out
+        elseif applicable(f, out, moments)
+            f(out, moments)
+            return out
+        elseif applicable(f, out, t)
+            f(out, t)
+            return out
+        elseif applicable(f, out)
+            f(out)
+            return out
+        else
+            throw(ArgumentError("embedded inflow callback must accept (out,moments,t), (out,moments), (out,t), or (out)"))
+        end
+    end
+
+    payload = bc.Tbc
+    if payload isa ScalarPayload{T}
+        fill!(out, payload.value)
+    elseif payload isa RefPayload{T}
+        fill!(out, payload.value[])
+    elseif payload isa VecPayload{T}
+        _check_length("embedded inflow VecPayload", length(payload.values), length(out))
+        copyto!(out, payload.values)
+    else
+        throw(ArgumentError("unsupported embedded inflow payload type $(typeof(payload))"))
+    end
+    return out
+end
+
+function _fill_embedded_tbc!(out::AbstractVector{T},
+                             ::NoEmbeddedAdvBC{T},
+                             _moments::GeometricMoments{N,T},
+                             _t::T) where {N,T}
+    fill!(out, zero(T))
+    return out
+end
+
+function _embedded_normal_speed!(
+    out::AbstractVector{T},
+    moments::GeometricMoments{N,T},
+    uγ::NTuple{N,<:AbstractVector},
+    igamma_tol::T,
+) where {N,T}
+    Nd = length(out)
+    _check_velocity_tuple("uγ", uγ, Nd)
+    _check_length("interface_measure", length(moments.interface_measure), Nd)
+    _check_length("interface_normal", length(moments.interface_normal), Nd)
+
+    @inbounds for i in 1:Nd
+        if _is_interface_cell(moments.interface_measure[i], igamma_tol)
+            n = moments.interface_normal[i]
+            acc = zero(T)
+            for d in 1:N
+                acc += uγ[d][i] * n[d]
+            end
+            out[i] = acc
+        else
+            out[i] = zero(T)
+        end
+    end
+    return out
+end
+
+function _embedded_uvec_from_normal!(
+    out::AbstractVector{T},
+    moments::GeometricMoments{N,T},
+    u_nγ::AbstractVector,
+    d::Int,
+    igamma_tol::T,
+) where {N,T}
+    Nd = length(out)
+    _check_length("u_nγ", length(u_nγ), Nd)
+    _check_length("interface_measure", length(moments.interface_measure), Nd)
+    _check_length("interface_normal", length(moments.interface_normal), Nd)
+
+    @inbounds for i in 1:Nd
+        if _is_interface_cell(moments.interface_measure[i], igamma_tol)
+            out[i] = u_nγ[i] * moments.interface_normal[i][d]
+        else
+            out[i] = zero(T)
+        end
+    end
+    return out
+end
+
+function embedded_trace_upwind!(
+    Tγ_eff::AbstractVector{T},
+    moments::GeometricMoments{N,T},
+    u_nγ::AbstractVector,
+    Tω::AbstractVector,
+    bc::AbstractEmbeddedAdvBC{T},
+    Tbc_full::AbstractVector,
+    igamma_tol::T;
+    t::T=zero(T),
+) where {N,T}
+    Nd = length(Tγ_eff)
+    _check_length("u_nγ", length(u_nγ), Nd)
+    _check_length("Tω", length(Tω), Nd)
+    _check_length("Tbc_full", length(Tbc_full), Nd)
+    _check_length("interface_measure", length(moments.interface_measure), Nd)
+
+    copyto!(Tγ_eff, Tω)
+    _fill_embedded_tbc!(Tbc_full, bc, moments, t)
+
+    bc isa NoEmbeddedAdvBC{T} && return Tγ_eff
+
+    @inbounds for i in 1:Nd
+        if _is_interface_cell(moments.interface_measure[i], igamma_tol) && u_nγ[i] < zero(T)
+            Tγ_eff[i] = Tbc_full[i]
+        end
+    end
+    return Tγ_eff
+end
+
 @inline function _minmod2(a::T, b::T) where {T}
     if a * b <= zero(T)
         return zero(T)
@@ -2295,7 +2455,11 @@ function convection!(out::AbstractVector, ops::KernelConvectionOps{N,T},
                      Tω::AbstractVector,
                      Tγ::AbstractVector,
                      work::KernelWork;
-                     scheme::AdvectionScheme=Centered()) where {N,T}
+                     scheme::AdvectionScheme=Centered(),
+                     moments::Union{Nothing,GeometricMoments{N,T}}=nothing,
+                     embedded_bc::AbstractEmbeddedAdvBC{T}=NoEmbeddedAdvBC{T}(),
+                     igamma_tol::T=sqrt(eps(T)),
+                     t::T=zero(T)) where {N,T}
     Nd = ops.Nd
     _check_length("out", length(out), Nd)
     _check_velocity_tuple("uω", uω, Nd)
@@ -2303,9 +2467,17 @@ function convection!(out::AbstractVector, ops::KernelConvectionOps{N,T},
     _check_scalar_pair(Nd, Tω, Tγ)
     _check_convection_work(work, ops)
 
+    Tγ_eff = Tγ
+    if !(embedded_bc isa NoEmbeddedAdvBC{T})
+        moments === nothing && throw(ArgumentError("embedded advection BC requires `moments` with interface geometry"))
+        _embedded_normal_speed!(work.t1, moments, uγ, igamma_tol)
+        embedded_trace_upwind!(work.t2, moments, work.t1, Tω, embedded_bc, work.t3, igamma_tol; t=t)
+        Tγ_eff = work.t2
+    end
+
     @inbounds for i in 1:Nd
         out[i] = zero(T)
-        work.t5[i] = T(0.5) * (Tω[i] + Tγ[i])
+        work.t5[i] = T(0.5) * (Tω[i] + Tγ_eff[i])
     end
 
     @inbounds for d in 1:N
@@ -2317,6 +2489,36 @@ function convection!(out::AbstractVector, ops::KernelConvectionOps{N,T},
     end
 
     return out
+end
+
+function convection!(
+    out::AbstractVector,
+    ops::KernelConvectionOps{N,T},
+    uω::NTuple{N,<:AbstractVector},
+    u_nγ::AbstractVector,
+    Tω::AbstractVector,
+    work::KernelWork;
+    scheme::AdvectionScheme=Centered(),
+    moments::GeometricMoments{N,T},
+    embedded_bc::AbstractEmbeddedAdvBC{T}=NoEmbeddedAdvBC{T}(),
+    igamma_tol::T=sqrt(eps(T)),
+    t::T=zero(T),
+) where {N,T}
+    Nd = ops.Nd
+    _check_length("u_nγ", length(u_nγ), Nd)
+    _check_length("work.g", length(work.g), N * Nd)
+
+    uγ_from_normal = ntuple(d -> begin
+        off = (d - 1) * Nd
+        viewd = @view work.g[(off + 1):(off + Nd)]
+        _embedded_uvec_from_normal!(viewd, moments, u_nγ, d, igamma_tol)
+        viewd
+    end, N)
+
+    embedded_trace_upwind!(work.t1, moments, u_nγ, Tω, embedded_bc, work.t2, igamma_tol; t=t)
+    return convection!(out, ops, uω, uγ_from_normal, Tω, work.t1, work;
+                       scheme=scheme, moments=nothing, embedded_bc=NoEmbeddedAdvBC{T}(),
+                       igamma_tol=igamma_tol, t=t)
 end
 
 function advection_diffusion_matrix(adops::AssembledAdvectionDiffusionOps{N,T},
@@ -2360,7 +2562,11 @@ function advection_diffusion!(out::AbstractVector, adops::KernelAdvectionDiffusi
                               Tγ::AbstractVector,
                               work_diff::KernelWork,
                               work_adv::KernelWork;
-                              scheme::AdvectionScheme=Centered()) where {N,T}
+                              scheme::AdvectionScheme=Centered(),
+                              moments::Union{Nothing,GeometricMoments{N,T}}=nothing,
+                              embedded_bc::AbstractEmbeddedAdvBC{T}=NoEmbeddedAdvBC{T}(),
+                              igamma_tol::T=sqrt(eps(T)),
+                              t::T=zero(T)) where {N,T}
     Nd = adops.diff.Nd
     _check_length("out", length(out), Nd)
     _check_velocity_tuple("uω", uω, Nd)
@@ -2370,7 +2576,9 @@ function advection_diffusion!(out::AbstractVector, adops::KernelAdvectionDiffusi
     _check_convection_work(work_adv, adops.adv)
 
     laplacian!(work_diff.t4, adops.diff, Tω, Tγ, work_diff)
-    convection!(out, adops.adv, uω, uγ, Tω, Tγ, work_adv; scheme=scheme)
+    convection!(out, adops.adv, uω, uγ, Tω, Tγ, work_adv;
+                scheme=scheme, moments=moments, embedded_bc=embedded_bc,
+                igamma_tol=igamma_tol, t=t)
     @inbounds for i in 1:Nd
         out[i] += adops.κ * work_diff.t4[i]
     end

@@ -1625,3 +1625,67 @@ end
     div_gamma!(hqK, kops, qγ, work)
     @test isapprox(hqA, hqK; atol=1e-12, rtol=1e-12)
 end
+
+@testset "Embedded Inflow Trace Selection" begin
+    m = build_2d_moments()
+    Nd = prod(length.(m.xyz))
+    tol = sqrt(eps(Float64))
+
+    iface = [i for i in 1:Nd if isfinite(m.interface_measure[i]) && m.interface_measure[i] > tol]
+    @test !isempty(iface)
+
+    Tω = fill(1.0, Nd)
+    Tγeff = similar(Tω)
+    Tbc = similar(Tω)
+    u_nγ = ones(Float64, Nd)
+    bc = EmbeddedInflow(4.0)
+
+    embedded_trace_upwind!(Tγeff, m, u_nγ, Tω, bc, Tbc, tol)
+    @test all(i -> Tγeff[i] == 1.0, iface)
+
+    fill!(u_nγ, -1.0)
+    embedded_trace_upwind!(Tγeff, m, u_nγ, Tω, bc, Tbc, tol)
+    @test all(i -> Tγeff[i] == 4.0, iface)
+    @test all(i -> Tγeff[i] == 1.0, setdiff(collect(1:Nd), iface))
+
+    bc_fun = EmbeddedInflow(0.0; fun=(dest, _mom, _t) -> fill!(dest, 2.5))
+    embedded_trace_upwind!(Tγeff, m, u_nγ, Tω, bc_fun, Tbc, tol)
+    @test all(i -> Tγeff[i] == 2.5, iface)
+end
+
+@testset "Embedded No-Injection Mass Rate (Periodic Outer BC)" begin
+    m = build_2d_moments()
+    bc_adv = AdvBoxBC(
+        (AdvPeriodic(Float64), AdvPeriodic(Float64)),
+        (AdvPeriodic(Float64), AdvPeriodic(Float64)),
+    )
+    cops = kernel_convection_ops(m; bc_adv=bc_adv)
+    work = KernelWork(cops)
+    Nd = cops.Nd
+    dims = cops.dims
+    li = LinearIndices(dims)
+
+    u1 = zeros(Float64, Nd)
+    u2 = zeros(Float64, Nd)
+    @inbounds for I in CartesianIndices(dims)
+        idx = li[I]
+        x = m.xyz[1][I[1]] - 0.5
+        y = m.xyz[2][I[2]] - 0.5
+        u1[idx] = -y
+        u2[idx] = x
+    end
+    uω = (u1, u2)
+    uγ = (copy(u1), copy(u2))
+
+    Tω = ones(Float64, Nd)
+    Tγ = ones(Float64, Nd)
+    out = zeros(Float64, Nd)
+
+    convection!(out, cops, uω, uγ, Tω, Tγ, work;
+                scheme=Centered(),
+                moments=m,
+                embedded_bc=NoEmbeddedAdvBC(Float64))
+
+    @test isfinite(sum(out))
+    @test abs(sum(out)) ≤ 1e-8
+end
