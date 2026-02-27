@@ -551,6 +551,50 @@ end
     end
 end
 
+@testset "Variable kappa face sampling and weighted Laplacian" begin
+    m = build_2d_outside_circle_moments()
+    bc = BoxBC(Val(2), Float64)
+    aops = assembled_ops(m; bc=bc)
+
+    Nd = aops.Nd
+    kappa_cell = collect(range(0.7, 1.9; length=Nd))
+    kappa_face_h = cell_to_face_values(aops, kappa_cell; averaging=:harmonic)
+    kappa_face_a = cell_to_face_values(aops, kappa_cell; averaging=:arithmetic)
+
+    @test length(kappa_face_h) == 2 * Nd
+    @test length(kappa_face_a) == 2 * Nd
+
+    for d in 1:2
+        kd_h = component_view(kappa_face_h, d, Nd)
+        kd_a = component_view(kappa_face_a, d, Nd)
+        padded = plane_indices(aops.dims, d, aops.dims[d])
+        @test all(abs.(kd_h[padded]) .<= 1e-14)
+        @test all(abs.(kd_a[padded]) .<= 1e-14)
+    end
+
+    xω = randn(Nd)
+    xγ = randn(Nd)
+    Lw = laplacian_matrix(aops, xω, xγ, kappa_face_h)
+    tmp = aops.Winv * (aops.G * xω + aops.H * xγ)
+    tmp .*= kappa_face_h
+    ref = -(aops.G' * tmp)
+    @test isapprox(Lw, ref; atol=1e-12, rtol=1e-12)
+
+    bcD = BoxBC(
+        (Dirichlet(1.0), Neumann(0.0)),
+        (Dirichlet(2.0), Neumann(0.0))
+    )
+    dops = assembled_ops(m; bc=bcD)
+    kd = cell_to_face_values(dops, kappa_cell; averaging=:harmonic)
+    rhs = dirichlet_rhs(dops, kd)
+    uD = zeros(Float64, Nd)
+    dirichlet_values_vector!(uD, dops.dims, dops.bc)
+    tmpd = dops.Winv * (dops.G * uD)
+    tmpd .*= kd
+    rhs_ref = -(dops.G' * tmpd)
+    @test isapprox(rhs, rhs_ref; atol=1e-12, rtol=1e-12)
+end
+
 @testset "Dirichlet payload helpers and updateability" begin
     m = build_2d_full_moments()
     dims = ntuple(d -> length(m.xyz[d]), 2)

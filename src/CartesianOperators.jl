@@ -24,6 +24,7 @@ export dm!, dmT!, dp!, sm!
 export apply_dirichlet_rows!, impose_dirichlet!
 export dirichlet_rhs, dirichlet_rhs!
 export dirichlet_mask_values, dirichlet_values_vector!, copy_with_dirichlet!
+export cell_to_face_values, cell_to_face_values!
 export AbstractConstraint, RobinConstraint, FluxJumpConstraint, ScalarJumpConstraint
 export robin_constraint_matrices, robin_constraint_row
 export fluxjump_constraint_matrices, fluxjump_constraint_row
@@ -1292,6 +1293,101 @@ function impose_dirichlet!(A::SparseMatrixCSC{T,Int}, rhs::AbstractVector,
     return A, rhs
 end
 
+@inline function _validate_kappa_face_averaging(averaging::Symbol)
+    (averaging === :harmonic || averaging === :arithmetic) ||
+        throw(ArgumentError("averaging must be :harmonic or :arithmetic, got $averaging"))
+    return averaging
+end
+
+@inline function _face_average_pair(a::T, b::T, averaging::Symbol) where {T}
+    if averaging === :arithmetic
+        return T(0.5) * (a + b)
+    end
+    denom = a + b
+    return iszero(denom) ? zero(T) : (T(2) * a * b) / denom
+end
+
+function _cell_to_face_values!(
+    out::AbstractVector{T},
+    dims::NTuple{N,Int},
+    bc::BoxBC{N,T},
+    kappa_cell::AbstractVector,
+    averaging::Symbol,
+) where {N,T}
+    Nd = prod(dims)
+    _check_length("kappa_cell", length(kappa_cell), Nd)
+    _check_length("out", length(out), N * Nd)
+    _validate_kappa_face_averaging(averaging)
+
+    @inbounds for d in 1:N
+        mode = _bc_mode(bc.lo[d], bc.hi[d])
+        sd = _stride(dims, d)
+        ld = dims[d]
+        block = sd * ld
+        nblocks = Nd ÷ block
+        off = (d - 1) * Nd
+
+        for outer in 0:(nblocks - 1)
+            base = outer * block
+            for lane in 1:sd
+                first = base + lane
+                last = first + (ld - 1) * sd
+
+                if ld == 1
+                    out[off + first] = zero(T)
+                    continue
+                end
+
+                if mode == :periodic
+                    wrap = first + (ld - 2) * sd
+                    a = convert(T, kappa_cell[first])
+                    b = convert(T, kappa_cell[wrap])
+                    out[off + first] = _face_average_pair(a, b, averaging)
+                else
+                    out[off + first] = convert(T, kappa_cell[first])
+                end
+
+                for k in 2:(ld - 1)
+                    idx = first + (k - 1) * sd
+                    a = convert(T, kappa_cell[idx])
+                    b = convert(T, kappa_cell[idx - sd])
+                    out[off + idx] = _face_average_pair(a, b, averaging)
+                end
+
+                out[off + last] = zero(T)
+            end
+        end
+    end
+
+    return out
+end
+
+function cell_to_face_values!(
+    out::AbstractVector{T},
+    ops::AssembledOps{N,T},
+    kappa_cell::AbstractVector;
+    averaging::Symbol=:harmonic,
+) where {N,T}
+    return _cell_to_face_values!(out, ops.dims, ops.bc, kappa_cell, averaging)
+end
+
+function cell_to_face_values(
+    ops::AssembledOps{N,T},
+    kappa_cell::AbstractVector;
+    averaging::Symbol=:harmonic,
+) where {N,T}
+    out = zeros(T, N * ops.Nd)
+    return cell_to_face_values!(out, ops, kappa_cell; averaging=averaging)
+end
+
+function cell_to_face_values(
+    ops::AssembledOps{N,T},
+    kappa_cell::Real;
+    averaging::Symbol=:harmonic,
+) where {N,T}
+    tmp = fill(convert(T, kappa_cell), ops.Nd)
+    return cell_to_face_values(ops, tmp; averaging=averaging)
+end
 
 function gradient_matrix(G::AbstractMatrix, H::AbstractMatrix, Winv::AbstractMatrix,
                          xω::AbstractVector, xγ::AbstractVector)
@@ -1308,6 +1404,22 @@ function laplacian_matrix(G::AbstractMatrix, H::AbstractMatrix, Winv::AbstractMa
     return -G' * Winv * (G * xω + H * xγ)
 end
 
+function laplacian_matrix(
+    G::AbstractMatrix,
+    H::AbstractMatrix,
+    Winv::AbstractMatrix,
+    xω::AbstractVector,
+    xγ::AbstractVector,
+    kappa_face::AbstractVector,
+)
+    tmp = Winv * (G * xω + H * xγ)
+    _check_length("kappa_face", length(kappa_face), length(tmp))
+    @inbounds for i in eachindex(tmp)
+        tmp[i] *= kappa_face[i]
+    end
+    return -(G' * tmp)
+end
+
 gradient_matrix(ops::AssembledOps, xω::AbstractVector, xγ::AbstractVector) =
     gradient_matrix(ops.G, ops.H, ops.Winv, xω, xγ)
 
@@ -1321,6 +1433,21 @@ function laplacian_matrix(ops::AssembledOps{N,T}, xω::AbstractVector, xγ::Abst
     xωeff = Vector{T}(undef, ops.Nd)
     copy_with_dirichlet!(xωeff, xω, ops.dims, ops.bc)
     return laplacian_matrix(ops.G, ops.H, ops.Winv, xωeff, xγ)
+end
+
+function laplacian_matrix(
+    ops::AssembledOps{N,T},
+    xω::AbstractVector,
+    xγ::AbstractVector,
+    kappa_face::AbstractVector,
+) where {N,T}
+    _check_length("kappa_face", length(kappa_face), N * ops.Nd)
+    if !_has_dirichlet(ops.bc)
+        return laplacian_matrix(ops.G, ops.H, ops.Winv, xω, xγ, kappa_face)
+    end
+    xωeff = Vector{T}(undef, ops.Nd)
+    copy_with_dirichlet!(xωeff, xω, ops.dims, ops.bc)
+    return laplacian_matrix(ops.G, ops.H, ops.Winv, xωeff, xγ, kappa_face)
 end
 
 function gradient!(out::AbstractVector, G::AbstractMatrix, H::AbstractMatrix, Winv::AbstractMatrix,
@@ -1341,6 +1468,19 @@ function laplacian!(out::AbstractVector, G::AbstractMatrix, H::AbstractMatrix, W
     return out
 end
 
+function laplacian!(
+    out::AbstractVector,
+    G::AbstractMatrix,
+    H::AbstractMatrix,
+    Winv::AbstractMatrix,
+    xω::AbstractVector,
+    xγ::AbstractVector,
+    kappa_face::AbstractVector,
+)
+    out .= laplacian_matrix(G, H, Winv, xω, xγ, kappa_face)
+    return out
+end
+
 gradient!(out::AbstractVector, ops::AssembledOps,
           xω::AbstractVector, xγ::AbstractVector) =
     gradient!(out, ops.G, ops.H, ops.Winv, xω, xγ)
@@ -1352,6 +1492,17 @@ divergence!(out::AbstractVector, ops::AssembledOps,
 function laplacian!(out::AbstractVector, ops::AssembledOps,
                     xω::AbstractVector, xγ::AbstractVector)
     out .= laplacian_matrix(ops, xω, xγ)
+    return out
+end
+
+function laplacian!(
+    out::AbstractVector,
+    ops::AssembledOps,
+    xω::AbstractVector,
+    xγ::AbstractVector,
+    kappa_face::AbstractVector,
+)
+    out .= laplacian_matrix(ops, xω, xγ, kappa_face)
     return out
 end
 
@@ -1766,6 +1917,33 @@ end
 function dirichlet_rhs(ops::AssembledOps{N,T}) where {N,T}
     out = zeros(T, ops.Nd)
     return dirichlet_rhs!(out, ops)
+end
+
+function dirichlet_rhs!(
+    out::AbstractVector{T},
+    ops::AssembledOps{N,T},
+    kappa_face::AbstractVector,
+) where {N,T}
+    _check_length("out", length(out), ops.Nd)
+    _check_length("kappa_face", length(kappa_face), N * ops.Nd)
+    if !_has_dirichlet(ops.bc)
+        fill!(out, zero(T))
+        return out
+    end
+
+    dirichlet_values_vector!(out, ops.dims, ops.bc)
+    tmp = ops.G * out
+    tmp = ops.Winv * tmp
+    @inbounds for i in eachindex(tmp)
+        tmp[i] *= kappa_face[i]
+    end
+    out .= -(ops.G' * tmp)
+    return out
+end
+
+function dirichlet_rhs(ops::AssembledOps{N,T}, kappa_face::AbstractVector) where {N,T}
+    out = zeros(T, ops.Nd)
+    return dirichlet_rhs!(out, ops, kappa_face)
 end
 
 function dirichlet_rhs!(out::AbstractVector{T},
