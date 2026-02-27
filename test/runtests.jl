@@ -179,6 +179,69 @@ function enforce_periodic_duplicate_2d!(T::AbstractVector, dims::NTuple{2,Int})
     return T
 end
 
+function periodic_1d_full_moments(nx::Int)
+    x = collect(range(0.0, 1.0; length=nx + 1))
+    full_domain(x, _=0) = -1.0
+    return geometric_moments(full_domain, (x,), Float64, zero; method=:implicitintegration)
+end
+
+function periodic_sine_state_1d(m, dims::NTuple{1,Int}; phase::Float64=0.0)
+    Nd = prod(dims)
+    li = LinearIndices(dims)
+    u = zeros(Float64, Nd)
+    @inbounds for i in 1:(dims[1] - 1)
+        u[li[i]] = sin(2pi * (m.xyz[1][i] + phase))
+    end
+    enforce_periodic_duplicate_1d!(u, dims)
+    return u
+end
+
+function l1_phys_1d(u::AbstractVector, v::AbstractVector, dims::NTuple{1,Int})
+    phys = physical_indices(dims)
+    s = 0.0
+    @inbounds for i in phys
+        s += abs(u[i] - v[i])
+    end
+    return s / length(phys)
+end
+
+function rk2_periodic_convection_1d!(
+    u::AbstractVector{Float64},
+    cops::KernelConvectionOps{1,Float64},
+    work::KernelWork{Float64},
+    V::AbstractVector{Float64},
+    uω::NTuple{1,Vector{Float64}},
+    uγ::NTuple{1,Vector{Float64}},
+    Tγ::Vector{Float64},
+    scheme::AdvectionScheme;
+    dt::Float64,
+    nsteps::Int,
+)
+    rhs0 = zeros(Float64, length(u))
+    rhs1 = zeros(Float64, length(u))
+    u1 = similar(u)
+
+    @inbounds for _ in 1:nsteps
+        convection!(rhs0, cops, uω, uγ, u, Tγ, work; scheme=scheme)
+        for i in eachindex(u)
+            Vi = V[i]
+            u1[i] = Vi > 0.0 ? (u[i] + dt * rhs0[i] / Vi) : u[i]
+        end
+        enforce_periodic_duplicate_1d!(u1, cops.dims)
+
+        convection!(rhs1, cops, uω, uγ, u1, Tγ, work; scheme=scheme)
+        for i in eachindex(u)
+            Vi = V[i]
+            if Vi > 0.0
+                u[i] = 0.5 * u[i] + 0.5 * (u1[i] + dt * rhs1[i] / Vi)
+            end
+        end
+        enforce_periodic_duplicate_1d!(u, cops.dims)
+    end
+
+    return u
+end
+
 function check_w_pseudoinverse(cap::MomentCapacity)
     N = length(cap.dims)
     for d in 1:N
@@ -813,6 +876,59 @@ end
     trans_u = count(i -> (Tu[i] > 0.1 && Tu[i] < 0.9), phys)
     trans_m = count(i -> (Tm[i] > 0.1 && Tm[i] < 0.9), phys)
     @test trans_m ≤ trans_u
+end
+
+@testset "Convection 1D MUSCL periodic sine convergence (L1)" begin
+    function run_orders(scheme::AdvectionScheme; tf::Float64=0.2, cfl::Float64=0.5)
+        nx_list = (32, 64, 128)
+        errs = Float64[]
+
+        for nx in nx_list
+            m = periodic_1d_full_moments(nx)
+            bc_adv = AdvBoxBC((AdvPeriodic{Float64}(),), (AdvPeriodic{Float64}(),))
+            cops = kernel_convection_ops(m; bc_adv=bc_adv)
+            work = KernelWork(cops)
+
+            Nd = cops.Nd
+            Tγ = zeros(Float64, Nd)
+            uω = (fill(1.0, Nd),)
+            uγ = (zeros(Float64, Nd),)
+            u0 = periodic_sine_state_1d(m, cops.dims; phase=0.0)
+            u = copy(u0)
+            V = m.V
+
+            dx = m.xyz[1][2] - m.xyz[1][1]
+            dt_cfl = cfl * dx
+            nsteps = max(1, ceil(Int, tf / dt_cfl))
+            dt = tf / nsteps
+            rk2_periodic_convection_1d!(u, cops, work, V, uω, uγ, Tγ, scheme; dt=dt, nsteps=nsteps)
+
+            u_plus = periodic_sine_state_1d(m, cops.dims; phase=tf)
+            u_minus = periodic_sine_state_1d(m, cops.dims; phase=-tf)
+            err = min(
+                l1_phys_1d(u, u_plus, cops.dims),
+                l1_phys_1d(u, u_minus, cops.dims),
+            )
+            push!(errs, err)
+        end
+
+        return errs, (
+            log2(errs[1] / errs[2]),
+            log2(errs[2] / errs[3]),
+        )
+    end
+
+    errs_mc, ord_mc = run_orders(MUSCL(MC()))
+    @test all(isfinite, errs_mc)
+    @test errs_mc[3] < errs_mc[2] < errs_mc[1]
+    @test ord_mc[1] > 1.8
+    @test ord_mc[2] > 1.8
+
+    errs_vl, ord_vl = run_orders(MUSCL(VanLeer()))
+    @test all(isfinite, errs_vl)
+    @test errs_vl[3] < errs_vl[2] < errs_vl[1]
+    @test ord_vl[1] > 1.8
+    @test ord_vl[2] > 1.8
 end
 
 @testset "Convection 1D Inflow BC (Meaningful Schemes)" begin
