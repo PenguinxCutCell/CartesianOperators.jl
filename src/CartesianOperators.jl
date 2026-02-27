@@ -1003,6 +1003,8 @@ function _apply_lo_inflow_upwind!(F::AbstractVector{T},
                                   dims::NTuple{N,Int},
                                   d::Int,
                                   bc_lo::AbstractAdvBC{T}) where {N,T}
+    bc_lo isa AdvInflow{T} || return F
+
     ld = dims[d]
     ld <= 2 && return F
 
@@ -2073,6 +2075,22 @@ function _bulk_muscl!(bulk::AbstractVector, ops::KernelConvectionOps{N,T}, d::In
                     continue
                 end
 
+                if mode == :periodic
+                    # Flux index i is aligned with the left face of cell i in the dmT/dp layout.
+                    # For this indexing, second-order MUSCL uses:
+                    # a>=0: q⁻_i = T_i - 0.5*s_i
+                    # a<0 : q⁺_{i-1} = T_{i-1} + 0.5*s_{i-1}
+                    for k in 1:(ld - 1)
+                        idx = first + (k - 1) * sd
+                        idxm = k == 1 ? first + (ld - 2) * sd : idx - sd
+                        a = Ad[idx] * uωd[idx]
+                        qface = a >= z ? (Tω[idx] - h * work.t3[idx]) : (Tω[idxm] + h * work.t3[idxm])
+                        work.t4[idx] = a * qface
+                    end
+                    work.t4[last] = z
+                    continue
+                end
+
                 for k in 1:(ld - 2)
                     idx = first + (k - 1) * sd
                     idxp = idx + sd
@@ -2085,11 +2103,7 @@ function _bulk_muscl!(bulk::AbstractVector, ops::KernelConvectionOps{N,T}, d::In
                 idx_nm1 = first + (ld - 2) * sd
                 a = Ad[idx_nm1] * uωd[idx_nm1]
                 TL = Tω[idx_nm1] + h * work.t3[idx_nm1]
-                TR = if mode == :periodic
-                    Tω[first] - h * work.t3[first]
-                else
-                    _ghost_hi(Tω[idx_nm1], uωd[idx_nm1], bchi_adv)
-                end
+                TR = _ghost_hi(Tω[idx_nm1], uωd[idx_nm1], bchi_adv)
                 work.t4[idx_nm1] = a >= z ? a * TL : a * TR
                 work.t4[last] = z
             end
