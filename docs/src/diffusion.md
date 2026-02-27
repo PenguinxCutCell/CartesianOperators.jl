@@ -24,8 +24,10 @@ For vectors `xω, xγ ∈ ℝ^{Nd}` and stacked fluxes `qω, qγ ∈ ℝ^{NNd}`:
 
 Notes:
 
-- `laplacian_matrix(ops, ...)` additionally applies Dirichlet row constraints when `BoxBC` contains `Dirichlet`.
-- Kernel `laplacian!` applies the same Dirichlet row constraint behavior via `apply_dirichlet_rows!`.
+- With `Dirichlet` in `BoxBC`, `laplacian_matrix(ops, ...)` and kernel `laplacian!` use
+  ghost-state elimination (boundary values injected into the effective `xω` state).
+- Explicit Dirichlet affine RHS can be built with `dirichlet_rhs` / `dirichlet_rhs!`.
+- Strong row replacement is optional and explicit (`impose_dirichlet!`), not default.
 
 ## Constructors
 
@@ -43,6 +45,7 @@ Notes:
 - `gradient_matrix(ops, xω, xγ)`
 - `divergence_matrix(ops, qω, qγ)`
 - `laplacian_matrix(ops, xω, xγ)`
+- `dirichlet_rhs(ops)` / `dirichlet_rhs!(rhs, ops)`
 
 Accessors:
 
@@ -57,6 +60,7 @@ Accessors:
 - `gradient!(g, ops::KernelOps, xω, xγ, work)`
 - `divergence!(y, ops::KernelOps, qω, qγ, work)`
 - `laplacian!(y, ops::KernelOps, xω, xγ, work)`
+- `dirichlet_rhs!(rhs, ops::KernelOps, work)`
 
 Low-level directional kernels:
 

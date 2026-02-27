@@ -15,7 +15,7 @@
 - Box boundary conditions for diffusion (`BoxBC`):
   - default `Neumann(0)`
   - `Periodic`
-  - `Dirichlet(value)` as row constraints
+  - `Dirichlet(value)` via ghost-state elimination (with explicit RHS contribution)
 - Hyperbolic scalar advection (`convection!`, `convection_matrix`) with schemes:
   - `Centered()`
   - `Upwind1()`
@@ -95,6 +95,10 @@ Diffusion and advection BC are intentionally separate:
 - Advection uses `AdvBoxBC` (`assembled_convection_ops`, `kernel_convection_ops`)
 
 This avoids mixing elliptic Dirichlet/Neumann behavior with hyperbolic inflow/outflow.
+
+For diffusion with `Dirichlet(value)`, the default Laplacian path keeps PDE rows and
+injects boundary values through ghost elimination. If needed, strong row replacement is
+still available explicitly with `impose_dirichlet!`.
 
 ## Constraint operators
 

@@ -29,10 +29,22 @@ ops = assembled_ops(m; bc=bc)
 
 ## Dirichlet enforcement
 
-Dirichlet is applied as constrained rows:
+Default diffusion behavior uses ghost-state elimination (no default row replacement):
 
-- assembled helper: `impose_dirichlet!(A, rhs, dims, bc)`
-- kernel helper: `apply_dirichlet_rows!(out, x, dims, bc)`
+- boundary values are injected into the effective state used by `laplacian_matrix` / `laplacian!`
+- `dirichlet_rhs` / `dirichlet_rhs!` provide the explicit affine RHS contribution
+
+Optional strong-row utilities are still available:
+
+- `impose_dirichlet!(A, rhs, dims, bc)` for assembled matrices
+- `apply_dirichlet_rows!(out, x, dims, bc)` for residual-row style forms
+
+In the node-padded layout, Dirichlet is imposed on **physical boundary layers**:
+
+- low side: index `1`
+- high side: index `dims[d]-1`
+
+The final padded layer `dims[d]` is not the physical boundary.
 
 ## Periodic duplicated-endpoint convention
 

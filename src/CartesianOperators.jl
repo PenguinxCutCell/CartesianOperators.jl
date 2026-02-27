@@ -21,6 +21,7 @@ export assembled_advection_diffusion_ops, kernel_advection_diffusion_ops
 export advection_diffusion_matrix, advection_diffusion!
 export dm!, dmT!, dp!, sm!
 export apply_dirichlet_rows!, impose_dirichlet!
+export dirichlet_rhs, dirichlet_rhs!
 export AbstractConstraint, RobinConstraint, FluxJumpConstraint, ScalarJumpConstraint
 export robin_constraint_matrices, robin_constraint_row
 export fluxjump_constraint_matrices, fluxjump_constraint_row
@@ -425,6 +426,7 @@ function MomentCapacity(m::GeometricMoments{N,T}; bc=nothing) where {N,T<:Real}
 
     invW = ntuple(d -> _pinv_w(W[d]), N)
     bcT = _validate_bc(_normalize_bc(bc, Val(N), FT))
+    _dirichlet_mask_values(dims, bcT)  # validates corner consistency once
 
     return MomentCapacity{N,FT}(A, B, W, invW, Iγ, dims, Nd, bcT)
 end
@@ -1083,7 +1085,9 @@ function _dirichlet_mask_values(dims::NTuple{N,Int}, bc::BoxBC{N,T}) where {N,T}
             @inbounds for outer in 0:(nblocks - 1)
                 base = outer * block
                 for off in 1:sd
-                    idx = base + off + (ld - 1) * sd
+                    # Dirichlet is imposed on the last physical layer (ld-1).
+                    # The final layer ld is padded/ghost in this node-padded layout.
+                    idx = ld > 1 ? (base + off + (ld - 2) * sd) : (base + off)
                     if mask[idx] && vals[idx] != u
                         throw(ArgumentError("conflicting Dirichlet values at boundary node $idx"))
                     end
@@ -1095,6 +1099,75 @@ function _dirichlet_mask_values(dims::NTuple{N,Int}, bc::BoxBC{N,T}) where {N,T}
     end
 
     return mask, vals
+end
+
+@inline function _has_dirichlet(bc::BoxBC{N}) where {N}
+    @inbounds for d in 1:N
+        if _is_dirichlet(bc.lo[d]) || _is_dirichlet(bc.hi[d])
+            return true
+        end
+    end
+    return false
+end
+
+function _apply_dirichlet_values!(x::AbstractVector{T},
+                                  dims::NTuple{N,Int},
+                                  bc::BoxBC{N,T}) where {N,T}
+    Nd = prod(dims)
+    _check_length("x", length(x), Nd)
+
+    @inbounds for d in 1:N
+        sd = _stride(dims, d)
+        ld = dims[d]
+        block = sd * ld
+        nblocks = Nd ÷ block
+
+        if bc.lo[d] isa Dirichlet{T}
+            u = (bc.lo[d]::Dirichlet{T}).u
+            for outer in 0:(nblocks - 1)
+                base = outer * block
+                for off in 1:sd
+                    x[base + off] = u
+                end
+            end
+        end
+
+        if bc.hi[d] isa Dirichlet{T}
+            u = (bc.hi[d]::Dirichlet{T}).u
+            hoff = ld > 1 ? (ld - 2) * sd : 0
+            for outer in 0:(nblocks - 1)
+                base = outer * block
+                for off in 1:sd
+                    x[base + off + hoff] = u
+                end
+            end
+        end
+    end
+
+    return x
+end
+
+function _copy_with_dirichlet!(dest::AbstractVector{T},
+                               src::AbstractVector,
+                               dims::NTuple{N,Int},
+                               bc::BoxBC{N,T}) where {N,T}
+    Nd = prod(dims)
+    _check_length("dest", length(dest), Nd)
+    _check_length("src", length(src), Nd)
+    @inbounds for i in 1:Nd
+        dest[i] = src[i]
+    end
+    return _apply_dirichlet_values!(dest, dims, bc)
+end
+
+function _dirichlet_values_vector!(out::AbstractVector{T},
+                                   dims::NTuple{N,Int},
+                                   bc::BoxBC{N,T}) where {N,T}
+    Nd = prod(dims)
+    _check_length("out", length(out), Nd)
+    fill!(out, zero(T))
+    _apply_dirichlet_values!(out, dims, bc)
+    return out
 end
 
 function apply_dirichlet_rows!(out::AbstractVector, x::AbstractVector,
@@ -1168,9 +1241,12 @@ divergence_matrix(ops::AssembledOps, qω::AbstractVector, qγ::AbstractVector) =
     divergence_matrix(ops.G, ops.H, qω, qγ)
 
 function laplacian_matrix(ops::AssembledOps{N,T}, xω::AbstractVector, xγ::AbstractVector) where {N,T}
-    y = laplacian_matrix(ops.G, ops.H, ops.Winv, xω, xγ)
-    apply_dirichlet_rows!(y, xω, ops.dims, ops.bc)
-    return y
+    if !_has_dirichlet(ops.bc)
+        return laplacian_matrix(ops.G, ops.H, ops.Winv, xω, xγ)
+    end
+    xωeff = Vector{T}(undef, ops.Nd)
+    _copy_with_dirichlet!(xωeff, xω, ops.dims, ops.bc)
+    return laplacian_matrix(ops.G, ops.H, ops.Winv, xωeff, xγ)
 end
 
 function gradient!(out::AbstractVector, G::AbstractMatrix, H::AbstractMatrix, Winv::AbstractMatrix,
@@ -1574,7 +1650,13 @@ function laplacian!(out::AbstractVector, ops::KernelOps{N},
     _check_work(work, ops)
     _check_length("out", length(out), ops.Nd)
 
-    gradient!(work.g, ops, xω, xγ, work)
+    xωeff = xω
+    if _has_dirichlet(ops.bc)
+        _copy_with_dirichlet!(work.t4, xω, ops.dims, ops.bc)
+        xωeff = work.t4
+    end
+
+    gradient!(work.g, ops, xωeff, xγ, work)
 
     Nd = ops.Nd
     fill!(out, zero(eltype(out)))
@@ -1590,8 +1672,47 @@ function laplacian!(out::AbstractVector, ops::KernelOps{N},
         end
     end
 
-    apply_dirichlet_rows!(out, xω, ops.dims, ops.bc)
     return out
+end
+
+function dirichlet_rhs!(out::AbstractVector{T}, ops::AssembledOps{N,T}) where {N,T}
+    _check_length("out", length(out), ops.Nd)
+    if !_has_dirichlet(ops.bc)
+        fill!(out, zero(T))
+        return out
+    end
+
+    _dirichlet_values_vector!(out, ops.dims, ops.bc)
+    tmp = ops.G * out
+    tmp = ops.Winv * tmp
+    out .= -(ops.G' * tmp)
+    return out
+end
+
+function dirichlet_rhs(ops::AssembledOps{N,T}) where {N,T}
+    out = zeros(T, ops.Nd)
+    return dirichlet_rhs!(out, ops)
+end
+
+function dirichlet_rhs!(out::AbstractVector{T},
+                        ops::KernelOps{N,T},
+                        work::KernelWork{T}) where {N,T}
+    _check_length("out", length(out), ops.Nd)
+    _check_work(work, ops)
+    if !_has_dirichlet(ops.bc)
+        fill!(out, zero(T))
+        return out
+    end
+
+    _dirichlet_values_vector!(work.t4, ops.dims, ops.bc)   # xω boundary values, zero interior
+    fill!(work.t3, zero(T))                                # xγ = 0
+    laplacian!(out, ops, work.t4, work.t3, work)
+    return out
+end
+
+function dirichlet_rhs(ops::KernelOps{N,T}, work::KernelWork{T}) where {N,T}
+    out = zeros(T, ops.Nd)
+    return dirichlet_rhs!(out, ops, work)
 end
 
 function _check_velocity_tuple(name::AbstractString, u::NTuple{N,<:AbstractVector}, Nd::Int) where {N}

@@ -93,6 +93,39 @@ function component_view(v::AbstractVector, d::Int, Nd::Int)
     return @view v[(off + 1):(off + Nd)]
 end
 
+function apply_box_dirichlet_state!(x::AbstractVector{T},
+                                    dims::NTuple{N,Int},
+                                    bc::BoxBC{N,T}) where {N,T}
+    Nd = prod(dims)
+    @assert length(x) == Nd
+    for d in 1:N
+        sd = d == 1 ? 1 : prod(dims[1:(d - 1)])
+        ld = dims[d]
+        block = sd * ld
+        nblocks = Nd ÷ block
+        if bc.lo[d] isa Dirichlet{T}
+            u = (bc.lo[d]::Dirichlet{T}).u
+            for outer in 0:(nblocks - 1)
+                base = outer * block
+                for off in 1:sd
+                    x[base + off] = u
+                end
+            end
+        end
+        if bc.hi[d] isa Dirichlet{T}
+            u = (bc.hi[d]::Dirichlet{T}).u
+            hoff = ld > 1 ? (ld - 2) * sd : 0
+            for outer in 0:(nblocks - 1)
+                base = outer * block
+                for off in 1:sd
+                    x[base + off + hoff] = u
+                end
+            end
+        end
+    end
+    return x
+end
+
 function affine_field(m, dims::NTuple{N,Int}) where {N}
     li = LinearIndices(dims)
     x = zeros(Float64, prod(dims))
@@ -490,7 +523,7 @@ end
     @test isapprox(la, lk; atol=1e-13, rtol=1e-13)
 end
 
-@testset "Dirichlet Box Constraint Rows" begin
+@testset "Dirichlet Box Ghost Elimination" begin
     m = build_2d_outside_circle_moments()
     u0 = 1.25
     bc = BoxBC(
@@ -511,14 +544,28 @@ end
     laplacian!(lk, kops, xω, xγ, work)
     @test isapprox(la, lk; atol=1e-13, rtol=1e-13)
 
+    xeff = copy(xω)
+    apply_box_dirichlet_state!(xeff, aops.dims, bc)
+    ref = laplacian_matrix(aops.G, aops.H, aops.Winv, xeff, xγ)
+    @test isapprox(la, ref; atol=1e-12, rtol=1e-12)
+
+    rhsA = dirichlet_rhs(aops)
+    rhsK = zeros(Nd)
+    dirichlet_rhs!(rhsK, kops, work)
+    @test isapprox(rhsA, rhsK; atol=1e-12, rtol=1e-12)
+
     li = LinearIndices(aops.dims)
     dir_idx = unique(vcat(
         [li[1, j] for j in 1:aops.dims[2]],
-        [li[aops.dims[1], j] for j in 1:aops.dims[2]]
+        [li[aops.dims[1] - 1, j] for j in 1:aops.dims[2]]
     ))
+    xω2 = copy(xω)
+    xω2[dir_idx] .= randn(length(dir_idx))
+    la2 = zeros(Nd)
+    laplacian!(la2, aops, xω2, xγ)
+    @test isapprox(la2, la; atol=1e-12, rtol=1e-12)
 
-    @test maximum(abs, la[dir_idx] .- (xω[dir_idx] .- u0)) ≤ 1e-13
-
+    # Optional strong-row utility still behaves as expected when called explicitly.
     L = copy(-aops.G' * aops.Winv * aops.G)
     rhs = zeros(Float64, Nd)
     impose_dirichlet!(L, rhs, aops.dims, bc)
@@ -882,7 +929,7 @@ end
     @test maximum(abs, la[phys]) ≤ 1e3
 end
 
-@testset "Laplacian boundary (Dirichlet) row identity regression" begin
+@testset "Laplacian boundary (Dirichlet) ghost elimination regression" begin
     m = build_2d_outside_circle_moments()
     u0 = 0.75
     bc = BoxBC(
@@ -890,29 +937,43 @@ end
         (Dirichlet(u0), Neumann(0.0))
     )
     aops = assembled_ops(m; bc=bc)
+    kops = kernel_ops(m; bc=bc)
+    work = KernelWork(kops)
 
     Nd = aops.Nd
-    xω = randn(Nd)
-    xγ = randn(Nd)
+    xω = fill(u0, Nd)
+    xγ = zeros(Nd)
     la = zeros(Nd)
+    lk = zeros(Nd)
     laplacian!(la, aops, xω, xγ)
+    laplacian!(lk, kops, xω, xγ, work)
+    @test isapprox(la, lk; atol=1e-13, rtol=1e-13)
 
+    rhsA = dirichlet_rhs(aops)
+    rhsK = zeros(Nd)
+    dirichlet_rhs!(rhsK, kops, work)
+    @test isapprox(rhsA, rhsK; atol=1e-12, rtol=1e-12)
+
+    Lω = -aops.G' * aops.Winv * aops.G
+    xhom = copy(xω)
     li = LinearIndices(aops.dims)
     dir_idx = unique(vcat(
         [li[1, j] for j in 1:aops.dims[2]],
-        [li[aops.dims[1], j] for j in 1:aops.dims[2]]
+        [li[aops.dims[1] - 1, j] for j in 1:aops.dims[2]]
     ))
-    @test maximum(abs, la[dir_idx] .- (xω[dir_idx] .- u0)) ≤ 1e-13
+    xhom[dir_idx] .= 0.0
+    ref = Lω * xhom .+ rhsA
+    @test isapprox(la, ref; atol=1e-12, rtol=1e-12)
 
-    L = copy(-aops.G' * aops.Winv * aops.G)
-    rhs = zeros(Float64, Nd)
-    impose_dirichlet!(L, rhs, aops.dims, bc)
-    for i in dir_idx
-        row = vec(Array(L[i, :]))
-        @test isapprox(row[i], 1.0; atol=1e-13, rtol=0.0)
-        @test count(abs.(row) .> 1e-13) == 1
-        @test isapprox(rhs[i], u0; atol=1e-13, rtol=0.0)
-    end
+    # Ghost elimination means boundary dofs are clamped to u0 and do not influence the operator.
+    xωa = randn(Nd)
+    xωb = copy(xωa)
+    xωb[dir_idx] .= randn(length(dir_idx))
+    ya = zeros(Nd)
+    yb = zeros(Nd)
+    laplacian!(ya, aops, xωa, zeros(Nd))
+    laplacian!(yb, aops, xωb, zeros(Nd))
+    @test isapprox(ya, yb; atol=1e-12, rtol=1e-12)
 end
 
 @testset "Convection 1D sharp peak: boundedness over many steps" begin
